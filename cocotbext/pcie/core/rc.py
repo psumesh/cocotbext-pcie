@@ -206,8 +206,12 @@ class RootComplex(Switch):
         await self.handle_tlp(tlp)
 
     async def handle_tlp(self, tlp):
-        if (tlp.fmt_type == TlpType.CPL or tlp.fmt_type == TlpType.CPL_DATA or
-                tlp.fmt_type == TlpType.CPL_LOCKED or tlp.fmt_type == TlpType.CPL_LOCKED_DATA):
+        if tlp.fmt_type in [
+            TlpType.CPL,
+            TlpType.CPL_DATA,
+            TlpType.CPL_LOCKED,
+            TlpType.CPL_LOCKED_DATA,
+        ]:
             self.rx_cpl_queues[tlp.tag].put_nowait(tlp)
             self.rx_cpl_sync[tlp.tag].set()
         elif tlp.fmt_type in self.rx_tlp_handler:
@@ -241,7 +245,7 @@ class RootComplex(Switch):
 
         while True:
             tag = self.current_tag
-            for k in range(tag_count):
+            for _ in range(tag_count):
                 tag = (tag + 1) % tag_count
                 if not self.tag_active[tag]:
                     self.tag_active[tag] = True
@@ -293,15 +297,14 @@ class RootComplex(Switch):
             cpl.length = 1
 
             self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
         else:
             self.log.warning("IO request did not match any regions")
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
             self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
+
+        await self.send(cpl)
 
     async def handle_io_write_tlp(self, tlp):
         if self.find_io_region(tlp.address):
@@ -338,15 +341,14 @@ class RootComplex(Switch):
             cpl.byte_count = 4
 
             self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
         else:
             self.log.warning("IO request did not match any regions")
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
             self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
+
+        await self.send(cpl)
 
     async def handle_mem_read_tlp(self, tlp):
         if self.find_region(tlp.address):
@@ -498,10 +500,7 @@ class RootComplex(Switch):
 
     async def config_read_words(self, dev, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         data = await self.config_read(dev, addr, count*ws, timeout, timeout_unit)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def config_read_dwords(self, dev, addr, count, byteorder='little', timeout=0, timeout_unit='ns'):
         return await self.config_read_words(dev, addr, count, byteorder, 4, timeout, timeout_unit)
@@ -586,10 +585,7 @@ class RootComplex(Switch):
 
     async def capability_read_words(self, dev, cap_id, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         data = await self.capability_read(dev, cap_id, addr, count*ws, timeout, timeout_unit)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def capability_read_dwords(self, dev, cap_id, addr, count, byteorder='little', timeout=0, timeout_unit='ns'):
         return await self.capability_read_words(dev, cap_id, addr, count, byteorder, 4, timeout, timeout_unit)
@@ -675,9 +671,8 @@ class RootComplex(Switch):
                 raise Exception("Timeout")
             if cpl.status != CplStatus.SC:
                 raise Exception("Unsuccessful completion")
-            else:
-                assert cpl.length == 1
-                d = cpl.get_data()
+            assert cpl.length == 1
+            d = cpl.get_data()
 
             data += d[first_pad:]
 
@@ -688,10 +683,7 @@ class RootComplex(Switch):
 
     async def io_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         data = await self.io_read(addr, count*ws, timeout, timeout_unit)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def io_read_dwords(self, addr, count, byteorder='little', timeout=0, timeout_unit='ns'):
         return await self.io_read_words(addr, count, byteorder, 4, timeout, timeout_unit)
@@ -777,10 +769,7 @@ class RootComplex(Switch):
 
         while n < length:
             tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_READ_64
-            else:
-                tlp.fmt_type = TlpType.MEM_READ
+            tlp.fmt_type = TlpType.MEM_READ_64 if addr > 0xffffffff else TlpType.MEM_READ
             tlp.requester_id = PcieId(0, 0, 0)
             tlp.attr = attr
             tlp.tc = tc
@@ -826,10 +815,7 @@ class RootComplex(Switch):
 
     async def mem_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         data = await self.mem_read(addr, count*ws, timeout, timeout_unit, attr, tc)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def mem_read_dwords(self, addr, count, byteorder='little', timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         return await self.mem_read_words(addr, count, byteorder, 4, timeout, timeout_unit, attr, tc)
@@ -858,10 +844,7 @@ class RootComplex(Switch):
 
         while n < len(data):
             tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_WRITE_64
-            else:
-                tlp.fmt_type = TlpType.MEM_WRITE
+            tlp.fmt_type = TlpType.MEM_WRITE_64 if addr > 0xffffffff else TlpType.MEM_WRITE
             tlp.requester_id = PcieId(0, 0, 0)
             tlp.attr = attr
             tlp.tc = tc
@@ -963,7 +946,7 @@ class RootComplex(Switch):
         self.log.info("MSI address: 0x%08x", ti.msi_addr)
         self.log.info("MSI base data: 0x%08x", ti.msi_data)
 
-        for k in range(32):
+        for _ in range(32):
             self.msi_events[self.msi_msg_limit] = [Event()]
             self.msi_callbacks[self.msi_msg_limit] = []
             self.msi_msg_limit += 1

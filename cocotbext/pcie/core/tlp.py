@@ -202,10 +202,7 @@ class Tlp:
 
     @fmt_type.setter
     def fmt_type(self, val):
-        if isinstance(val, TlpType):
-            self.fmt, self.type = val.value
-        else:
-            self.fmt, self.type = val
+        self.fmt, self.type = val.value if isinstance(val, TlpType) else val
 
     @property
     def completer_id(self):
@@ -234,40 +231,42 @@ class Tlp:
     def check(self):
         """Validate TLP"""
         ret = True
-        if self.fmt == TlpFmt.THREE_DW_DATA or self.fmt == TlpFmt.FOUR_DW_DATA:
+        if self.fmt in [TlpFmt.THREE_DW_DATA, TlpFmt.FOUR_DW_DATA]:
             if self.length*4 != len(self.data):
                 print("TLP validation failed, length field does not match data: %s" % repr(self))
                 ret = False
             if 0 > self.length > 1024:
                 print("TLP validation failed, length out of range: %s" % repr(self))
                 ret = False
-        if (self.fmt_type == TlpType.MEM_READ or self.fmt_type == TlpType.MEM_READ_64 or
-                self.fmt_type == TlpType.MEM_READ_LOCKED or self.fmt_type == TlpType.MEM_READ_LOCKED_64 or
-                self.fmt_type == TlpType.MEM_WRITE or self.fmt_type == TlpType.MEM_WRITE_64):
-            if self.length*4 > 0x1000 - (self.address & 0xfff):
-                print("TLP validation failed, request crosses 4K boundary: %s" % repr(self))
-                ret = False
-        if (self.fmt_type == TlpType.IO_READ or self.fmt_type == TlpType.IO_WRITE):
+        if self.fmt_type in [
+            TlpType.MEM_READ,
+            TlpType.MEM_READ_64,
+            TlpType.MEM_READ_LOCKED,
+            TlpType.MEM_READ_LOCKED_64,
+            TlpType.MEM_WRITE,
+            TlpType.MEM_WRITE_64,
+        ] and self.length * 4 > 0x1000 - (self.address & 0xFFF):
+            print("TLP validation failed, request crosses 4K boundary: %s" % repr(self))
+            ret = False
+        if self.fmt_type in [TlpType.IO_READ, TlpType.IO_WRITE]:
             if self.length != 1:
                 print("TLP validation failed, invalid length for IO request: %s" % repr(self))
                 ret = False
             if self.last_be != 0:
                 print("TLP validation failed, invalid last BE for IO request: %s" % repr(self))
                 ret = False
-        if (self.fmt_type == TlpType.CPL_DATA):
-            if (self.byte_count + (self.lower_address & 3) + 3) < self.length*4:
-                print("TLP validation failed, completion byte count too small: %s" % repr(self))
-                ret = False
+        if (self.fmt_type == TlpType.CPL_DATA) and (
+            self.byte_count + (self.lower_address & 3) + 3
+        ) < self.length * 4:
+            print("TLP validation failed, completion byte count too small: %s" % repr(self))
+            ret = False
         return ret
 
     @classmethod
     def create_completion_for_tlp(cls, tlp, completer_id, has_data=False, status=CplStatus.SC):
         """Prepare completion for TLP"""
         cpl = cls()
-        if has_data:
-            cpl.fmt_type = TlpType.CPL_DATA
-        else:
-            cpl.fmt_type = TlpType.CPL
+        cpl.fmt_type = TlpType.CPL_DATA if has_data else TlpType.CPL
         cpl.requester_id = tlp.requester_id
         cpl.completer_id = completer_id
         cpl.status = status
@@ -339,10 +338,7 @@ class Tlp:
 
     def get_last_be_offset(self):
         """Offset after last transferred byte from last byte enable"""
-        if self.length == 1:
-            be = self.first_be
-        else:
-            be = self.last_be
+        be = self.first_be if self.length == 1 else self.last_be
         if be & 0xf == 0x1:
             return 3
         elif be & 0xe == 0x2:
@@ -362,20 +358,20 @@ class Tlp:
 
     def has_data(self):
         """Return true if TLP has payload data"""
-        return self.fmt == TlpFmt.THREE_DW_DATA or self.fmt == TlpFmt.FOUR_DW_DATA
+        return self.fmt in [TlpFmt.THREE_DW_DATA, TlpFmt.FOUR_DW_DATA]
 
     def get_header_size(self):
         """Return size of TLP in bytes"""
-        if self.fmt == TlpFmt.THREE_DW or self.fmt == TlpFmt.THREE_DW_DATA:
+        if self.fmt in [TlpFmt.THREE_DW, TlpFmt.THREE_DW_DATA]:
             return 12
-        elif self.fmt == TlpFmt.FOUR_DW or self.fmt == TlpFmt.FOUR_DW_DATA:
+        elif self.fmt in [TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA]:
             return 16
 
     def get_header_size_dw(self):
         """Return size of TLP in dwords"""
-        if self.fmt == TlpFmt.THREE_DW or self.fmt == TlpFmt.THREE_DW_DATA:
+        if self.fmt in [TlpFmt.THREE_DW, TlpFmt.THREE_DW_DATA]:
             return 3
-        elif self.fmt == TlpFmt.FOUR_DW or self.fmt == TlpFmt.FOUR_DW_DATA:
+        elif self.fmt in [TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA]:
             return 4
 
     def get_payload_size(self):
@@ -421,25 +417,37 @@ class Tlp:
         dw |= (self.fmt & 0x7) << 29
         pkt.extend(struct.pack('>L', dw))
 
-        if (self.fmt_type == TlpType.CFG_READ_0 or self.fmt_type == TlpType.CFG_WRITE_0 or
-                self.fmt_type == TlpType.CFG_READ_1 or self.fmt_type == TlpType.CFG_WRITE_1 or
-                self.fmt_type == TlpType.MEM_READ or self.fmt_type == TlpType.MEM_READ_64 or
-                self.fmt_type == TlpType.MEM_READ_LOCKED or self.fmt_type == TlpType.MEM_READ_LOCKED_64 or
-                self.fmt_type == TlpType.MEM_WRITE or self.fmt_type == TlpType.MEM_WRITE_64 or
-                self.fmt_type == TlpType.IO_READ or self.fmt_type == TlpType.IO_WRITE):
+        if self.fmt_type in [
+            TlpType.CFG_READ_0,
+            TlpType.CFG_WRITE_0,
+            TlpType.CFG_READ_1,
+            TlpType.CFG_WRITE_1,
+            TlpType.MEM_READ,
+            TlpType.MEM_READ_64,
+            TlpType.MEM_READ_LOCKED,
+            TlpType.MEM_READ_LOCKED_64,
+            TlpType.MEM_WRITE,
+            TlpType.MEM_WRITE_64,
+            TlpType.IO_READ,
+            TlpType.IO_WRITE,
+        ]:
             dw = self.first_be & 0xf
             dw |= (self.last_be & 0xf) << 4
             dw |= (self.tag & 0x0ff) << 8
             dw |= int(self.requester_id) << 16
             pkt.extend(struct.pack('>L', dw))
 
-            if (self.fmt_type == TlpType.CFG_READ_0 or self.fmt_type == TlpType.CFG_WRITE_0 or
-                    self.fmt_type == TlpType.CFG_READ_1 or self.fmt_type == TlpType.CFG_WRITE_1):
+            if self.fmt_type in [
+                TlpType.CFG_READ_0,
+                TlpType.CFG_WRITE_0,
+                TlpType.CFG_READ_1,
+                TlpType.CFG_WRITE_1,
+            ]:
                 dw = (self.register_number & 0x3ff) << 2
                 dw |= int(self.dest_id) << 16
                 pkt.extend(struct.pack('>L', dw))
             else:
-                if self.fmt == TlpFmt.FOUR_DW or self.fmt == TlpFmt.FOUR_DW_DATA:
+                if self.fmt in [TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA]:
                     val = self.address & 0xfffffffffffffffc
                     val |= self.ph & 0x3
                     pkt.extend(struct.pack('>Q', val))
@@ -447,8 +455,12 @@ class Tlp:
                     dw = self.address & 0xfffffffc
                     dw |= self.ph & 0x3
                     pkt.extend(struct.pack('>L', dw))
-        elif (self.fmt_type == TlpType.CPL or self.fmt_type == TlpType.CPL_DATA or
-                self.fmt_type == TlpType.CPL_LOCKED or self.fmt_type == TlpType.CPL_LOCKED_DATA):
+        elif self.fmt_type in [
+            TlpType.CPL,
+            TlpType.CPL_DATA,
+            TlpType.CPL_LOCKED,
+            TlpType.CPL_LOCKED_DATA,
+        ]:
             dw = self.byte_count & 0xfff
             dw |= bool(self.bcm) << 12
             dw |= (self.status & 0x7) << 13
@@ -492,37 +504,55 @@ class Tlp:
         tlp.type = (dw >> 24) & 0x1f
         tlp.fmt = (dw >> 29) & 0x7
 
-        if tlp.fmt == TlpFmt.THREE_DW_DATA or tlp.fmt == TlpFmt.FOUR_DW_DATA:
-            if tlp.length == 0:
-                tlp.length = 1024
+        if (
+            tlp.fmt in [TlpFmt.THREE_DW_DATA, TlpFmt.FOUR_DW_DATA]
+            and tlp.length == 0
+        ):
+            tlp.length = 1024
 
-        if (tlp.fmt_type == TlpType.CFG_READ_0 or tlp.fmt_type == TlpType.CFG_WRITE_0 or
-                tlp.fmt_type == TlpType.CFG_READ_1 or tlp.fmt_type == TlpType.CFG_WRITE_1 or
-                tlp.fmt_type == TlpType.MEM_READ or tlp.fmt_type == TlpType.MEM_READ_64 or
-                tlp.fmt_type == TlpType.MEM_READ_LOCKED or tlp.fmt_type == TlpType.MEM_READ_LOCKED_64 or
-                tlp.fmt_type == TlpType.MEM_WRITE or tlp.fmt_type == TlpType.MEM_WRITE_64 or
-                tlp.fmt_type == TlpType.IO_READ or tlp.fmt_type == TlpType.IO_WRITE):
+        if tlp.fmt_type in [
+            TlpType.CFG_READ_0,
+            TlpType.CFG_WRITE_0,
+            TlpType.CFG_READ_1,
+            TlpType.CFG_WRITE_1,
+            TlpType.MEM_READ,
+            TlpType.MEM_READ_64,
+            TlpType.MEM_READ_LOCKED,
+            TlpType.MEM_READ_LOCKED_64,
+            TlpType.MEM_WRITE,
+            TlpType.MEM_WRITE_64,
+            TlpType.IO_READ,
+            TlpType.IO_WRITE,
+        ]:
             dw = struct.unpack_from('>L', pkt, 4)[0]
             tlp.first_be = dw & 0xf
             tlp.last_be = (dw >> 4) & 0xf
             tlp.tag |= (dw >> 8) & 0x0ff
             tlp.requester_id = PcieId.from_int(dw >> 16)
 
-            if (tlp.fmt_type == TlpType.CFG_READ_0 or tlp.fmt_type == TlpType.CFG_WRITE_0 or
-                    tlp.fmt_type == TlpType.CFG_READ_1 or tlp.fmt_type == TlpType.CFG_WRITE_1):
+            if tlp.fmt_type in [
+                TlpType.CFG_READ_0,
+                TlpType.CFG_WRITE_0,
+                TlpType.CFG_READ_1,
+                TlpType.CFG_WRITE_1,
+            ]:
                 dw = struct.unpack_from('>L', pkt, 8)[0]
                 tlp.register_number = (dw >> 2) >> 0x3ff
                 tlp.dest_id = PcieId.from_int(dw >> 16)
-            elif tlp.fmt == TlpFmt.THREE_DW or tlp.fmt == TlpFmt.THREE_DW_DATA:
+            elif tlp.fmt in [TlpFmt.THREE_DW, TlpFmt.THREE_DW_DATA]:
                 dw = struct.unpack_from('>L', pkt, 8)[0]
                 tlp.address = dw & 0xfffffffc
                 tlp.ph = dw & 0x3
-            elif tlp.fmt == TlpFmt.FOUR_DW or tlp.fmt == TlpFmt.FOUR_DW_DATA:
+            elif tlp.fmt in [TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA]:
                 val = struct.unpack_from('>Q', pkt, 8)[0]
                 tlp.address = val & 0xfffffffffffffffc
                 tlp.ph = val & 0x3
-        elif (tlp.fmt_type == TlpType.CPL or tlp.fmt_type == TlpType.CPL_DATA or
-                tlp.fmt_type == TlpType.CPL_LOCKED or tlp.fmt_type == TlpType.CPL_LOCKED_DATA):
+        elif tlp.fmt_type in [
+            TlpType.CPL,
+            TlpType.CPL_DATA,
+            TlpType.CPL_LOCKED,
+            TlpType.CPL_LOCKED_DATA,
+        ]:
             dw = struct.unpack_from('>L', pkt, 4)[0]
             tlp.byte_count = dw & 0xfff
             tlp.bcm = bool(dw & 1 << 12)

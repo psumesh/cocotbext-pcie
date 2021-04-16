@@ -431,7 +431,6 @@ class AerExtendedCapability(PcieExtCap):
                 self.fatal_error_reporting_enable = bool(data & 1 << 0)
                 self.nonfatal_error_reporting_enable = bool(data & 1 << 1)
                 self.correctable_error_reporting_enable = bool(data & 1 << 2)
-            pass
         elif reg == 12:
             # Root error status
             if mask & 0x1:
