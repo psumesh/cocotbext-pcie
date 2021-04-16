@@ -546,9 +546,8 @@ class PcieCapability(PcieCap):
                 self.crs_software_visibility_enable = bool(data & 1 << 4)
         elif reg == 8:
             # Root status
-            if mask & 0x4:
-                if data & 1 << 16:
-                    self.pme_status = False
+            if mask & 0x4 and data & 1 << 16:
+                self.pme_status = False
         elif reg == 10:
             # Device control 2
             if mask & 0x1:

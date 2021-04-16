@@ -191,10 +191,7 @@ class MemoryEndpoint(Endpoint):
             self.regions[self.bar_ptr] = mem
         else:
             self.regions[self.bar_ptr] = (read, write)
-        if ext:
-            self.bar_ptr += 2
-        else:
-            self.bar_ptr += 1
+        self.bar_ptr += 2 if ext else 1
         return mem
 
     def add_io_region(self, size, read=None, write=None):
@@ -261,15 +258,14 @@ class MemoryEndpoint(Endpoint):
             cpl.length = 1
 
             self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
         else:
             self.log.warning("IO request did not match any BARs")
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, self.pcie_id)
             self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
+
+        await self.send(cpl)
 
     async def handle_io_write_tlp(self, tlp):
         m = self.match_bar(tlp.address, True)
@@ -308,15 +304,14 @@ class MemoryEndpoint(Endpoint):
             cpl.byte_count = 4
 
             self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
         else:
             self.log.warning("IO request did not match any BARs")
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, self.pcie_id)
             self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
+
+        await self.send(cpl)
 
     async def handle_mem_read_tlp(self, tlp):
         m = self.match_bar(tlp.address)

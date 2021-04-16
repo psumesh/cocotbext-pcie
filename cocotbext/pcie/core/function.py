@@ -395,8 +395,12 @@ class Function:
         await self.handle_tlp(tlp)
 
     async def handle_tlp(self, tlp):
-        if (tlp.fmt_type == TlpType.CPL or tlp.fmt_type == TlpType.CPL_DATA or
-                tlp.fmt_type == TlpType.CPL_LOCKED or tlp.fmt_type == TlpType.CPL_LOCKED_DATA):
+        if tlp.fmt_type in [
+            TlpType.CPL,
+            TlpType.CPL_DATA,
+            TlpType.CPL_LOCKED,
+            TlpType.CPL_LOCKED_DATA,
+        ]:
             # completion
             self.rx_cpl_queues[tlp.tag].put_nowait(tlp)
             self.rx_cpl_sync[tlp.tag].set()
@@ -433,7 +437,7 @@ class Function:
 
         while True:
             tag = self.current_tag
-            for k in range(tag_count):
+            for _ in range(tag_count):
                 tag = (tag + 1) % tag_count
                 if not self.tag_active[tag]:
                     self.tag_active[tag] = True
@@ -523,9 +527,8 @@ class Function:
                 raise Exception("Timeout")
             if cpl.status != CplStatus.SC:
                 raise Exception("Unsuccessful completion")
-            else:
-                assert cpl.length == 1
-                d = cpl.get_data()
+            assert cpl.length == 1
+            d = cpl.get_data()
 
             data += d[first_pad:]
 
@@ -536,10 +539,7 @@ class Function:
 
     async def io_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         data = await self.io_read(addr, count*ws, timeout, timeout_unit)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def io_read_dwords(self, addr, count, byteorder='little', timeout=0, timeout_unit='ns'):
         return await self.io_read_words(addr, count, byteorder, 4, timeout, timeout_unit)
@@ -625,10 +625,7 @@ class Function:
 
         while n < length:
             tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_READ_64
-            else:
-                tlp.fmt_type = TlpType.MEM_READ
+            tlp.fmt_type = TlpType.MEM_READ_64 if addr > 0xffffffff else TlpType.MEM_READ
             tlp.requester_id = self.pcie_id
             tlp.attr = attr
             tlp.tc = tc
@@ -674,10 +671,7 @@ class Function:
 
     async def mem_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         data = await self.mem_read(addr, count*ws, timeout, timeout_unit, attr, tc)
-        words = []
-        for k in range(count):
-            words.append(int.from_bytes(data[ws*k:ws*(k+1)], byteorder))
-        return words
+        return [int.from_bytes(data[ws*k:ws*(k+1)], byteorder) for k in range(count)]
 
     async def mem_read_dwords(self, addr, count, byteorder='little', timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         return await self.mem_read_words(addr, count, byteorder, 4, timeout, timeout_unit, attr, tc)
@@ -706,10 +700,7 @@ class Function:
 
         while n < len(data):
             tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_WRITE_64
-            else:
-                tlp.fmt_type = TlpType.MEM_WRITE
+            tlp.fmt_type = TlpType.MEM_WRITE_64 if addr > 0xffffffff else TlpType.MEM_WRITE
             tlp.requester_id = self.pcie_id
             tlp.attr = attr
             tlp.tc = tc

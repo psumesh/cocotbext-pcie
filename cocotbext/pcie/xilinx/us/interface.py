@@ -284,7 +284,7 @@ class UsPcieSource(UsPcieBase):
                 self.bus.tuser <= 0
                 continue
 
-            if (tready_sample and tvalid_sample) or not tvalid_sample:
+            if tready_sample or not tvalid_sample:
                 if self.drive_obj and not self.pause:
                     self.bus.drive(self.drive_obj)
                     self.drive_obj = None
@@ -294,8 +294,8 @@ class UsPcieSource(UsPcieBase):
                 else:
                     self.bus.tvalid <= 0
                     self.active = bool(self.drive_obj)
-                    if not self.drive_obj:
-                        self.idle_event.set()
+                if not self.drive_obj:
+                    self.idle_event.set()
 
     async def _run(self):
         raise NotImplementedError
@@ -559,14 +559,14 @@ class RcSource(UsPcieSource):
             while frame_offset < len(frame.data):
                 transaction = self._transaction_obj()
 
+                last_lane = 0
+
                 if self.width == 512:
                     if first:
                         transaction.tuser |= 0b0001 << 64  # is_sop
                         transaction.tuser |= 0b00 << 68  # is_sop0_ptr
 
                     transaction.tuser |= bool(frame.discontinue) << 96
-
-                    last_lane = 0
 
                     for i in range(self.byte_width):
                         if frame_offset < len(frame.data):
@@ -588,8 +588,6 @@ class RcSource(UsPcieSource):
                         transaction.tuser |= 1 << 32  # is_sof_0
 
                     transaction.tuser |= bool(frame.discontinue) << 42
-
-                    last_lane = 0
 
                     for i in range(self.byte_width):
                         if frame_offset < len(frame.data):
@@ -633,10 +631,10 @@ class RcSink(UsPcieSink):
             sample = self.sample_obj
             self.sample_obj = None
 
+            last_lane = 0
+
             if self.width == 512:
                 frame.discontinue |= bool(sample.tuser & (1 << 96))
-
-                last_lane = 0
 
                 for i in range(self.byte_width):
                     if sample.tkeep & (1 << i):
@@ -646,8 +644,6 @@ class RcSink(UsPcieSink):
                         last_lane = i
             else:
                 frame.discontinue |= bool(sample.tuser & (1 << 42))
-
-                last_lane = 0
 
                 for i in range(self.byte_width):
                     if sample.tkeep & (1 << i):
