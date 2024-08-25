@@ -22,10 +22,5 @@ THE SOFTWARE.
 
 """
 
-from .common import PciCapId, PciExtCapId
-from .common import PciCap, PciExtCap, PciCapList, PciExtCapList
-
-from .pcie import PcieCapability, PcieExtendedCapability
-from .msi import MsiCapability, MsixCapability
-from .pm import PmCapability
-from .aer import AerExtendedCapability
+from .s10_model import S10PcieDevice, S10PcieFunction
+from .interface import S10RxBus, S10TxBus

@@ -23,23 +23,25 @@ THE SOFTWARE.
 """
 
 import logging
-import mmap
-import struct
 
-import cocotb
 from cocotb.queue import Queue
 from cocotb.triggers import Event, Timer, First
 
+from cocotbext.axi import AddressSpace
+
 from .version import __version__
 from .bridge import HostBridge, RootPort
-from .caps import PcieCapId
+from .msi import MsiRegion
+from .region import MemoryTlpRegion, IoTlpRegion
 from .switch import Switch
 from .tlp import Tlp, TlpType, TlpAttr, TlpTc, CplStatus
-from .utils import PcieId, TreeItem, align
+from .utils import PcieId
+from .pci import PciDevice, PciHostBridge
 
 
 class RootComplex(Switch):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, mem_address_space=None, io_address_space=None, *args, **kwargs):
+
         self.default_upstream_bridge = HostBridge
         self.default_downstream_bridge = RootPort
 
@@ -69,13 +71,13 @@ class RootComplex(Switch):
 
         self.upstream_bridge.upstream_tx_handler = self.downstream_recv
 
-        self.tree = TreeItem()
+        self.host_bridge = PciHostBridge(rc=self)
 
-        self.io_base = 0x80000000
+        self.io_base = 0x8000_0000
         self.io_limit = self.io_base
-        self.mem_base = 0x80000000
+        self.mem_base = 0xc000_0000
         self.mem_limit = self.mem_base
-        self.prefetchable_mem_base = 0x8000000000000000
+        self.prefetchable_mem_base = 0x8000_0000_0000_0000
         self.prefetchable_mem_limit = self.prefetchable_mem_base
 
         self.upstream_bridge.io_base = self.io_base
@@ -85,10 +87,29 @@ class RootComplex(Switch):
         self.upstream_bridge.prefetchable_mem_base = self.prefetchable_mem_base
         self.upstream_bridge.prefetchable_mem_limit = self.prefetchable_mem_limit
 
-        self.max_payload_size = 0
-        self.max_read_request_size = 2
-        self.read_completion_boundary = 128
-        self.extended_tag_field_enable = True
+        self._max_payload_size = 0
+        self._max_payload_size_supported = 5
+        self._max_read_request_size = 2
+        self._read_completion_boundary = False
+        self.bus_master_enable = True
+
+        self.split_on_all_rcb = False
+
+        self.mem_address_space = mem_address_space or AddressSpace(2**64)
+        self.io_address_space = io_address_space or AddressSpace(2**32)
+
+        self.mem_region = MemoryTlpRegion(self)
+        self.io_region = IoTlpRegion(self)
+
+        self.mem_address_space.register_region(self.mem_region,
+                self.mem_base, self.mem_base & -self.mem_base, offset=None)
+        self.mem_address_space.register_region(self.mem_region,
+                self.prefetchable_mem_base, self.prefetchable_mem_base & -self.prefetchable_mem_base, offset=None)
+        self.io_address_space.register_region(self.io_region,
+                self.io_base, self.io_base & -self.io_base, offset=None)
+
+        self.mem_pool = self.mem_address_space.create_pool(0x0000_0000, 0x8000_0000)
+        self.io_pool = self.io_address_space.create_pool(0x0000_0000, 0x8000_0000)
 
         self.region_base = 0
         self.region_limit = self.region_base
@@ -98,6 +119,10 @@ class RootComplex(Switch):
 
         self.regions = []
         self.io_regions = []
+
+        self.msi_region = MsiRegion(self)
+
+        self.mem_address_space.register_region(self.msi_region, 0x8000_0000)
 
         self.msi_addr = None
         self.msi_msg_limit = 0
@@ -111,88 +136,64 @@ class RootComplex(Switch):
         self.register_rx_tlp_handler(TlpType.MEM_WRITE, self.handle_mem_write_tlp)
         self.register_rx_tlp_handler(TlpType.MEM_WRITE_64, self.handle_mem_write_tlp)
 
-    def alloc_region(self, size, read=None, write=None):
-        addr = 0
-        mem = None
+    @property
+    def max_payload_size(self):
+        return self._max_payload_size
 
-        addr = align(self.region_limit, 2**(size-1).bit_length()-1)
-        self.region_limit = addr+size-1
-        if not read and not write:
-            mem = mmap.mmap(-1, size)
-            self.regions.append((addr, size, mem))
-        else:
-            self.regions.append((addr, size, read, write))
+    @max_payload_size.setter
+    def max_payload_size(self, val):
+        self._max_payload_size = val
+        self.upstream_bridge.pcie_cap.max_payload_size = val
 
-        return addr, mem
+    @property
+    def max_payload_size_supported(self):
+        return self._max_payload_size_supported
 
-    def alloc_io_region(self, size, read=None, write=None):
-        addr = 0
-        mem = None
+    @max_payload_size_supported.setter
+    def max_payload_size_supported(self, val):
+        self._max_payload_size_supported = val
+        self.upstream_bridge.pcie_cap.max_payload_size_supported = val
 
-        addr = align(self.io_region_limit, 2**(size-1).bit_length()-1)
-        self.io_region_limit = addr+size-1
-        if not read and not write:
-            mem = mmap.mmap(-1, size)
-            self.io_regions.append((addr, size, mem))
-        else:
-            self.io_regions.append((addr, size, read, write))
+    @property
+    def max_read_request_size(self):
+        return self._max_read_request_size
 
-        return addr, mem
+    @max_read_request_size.setter
+    def max_read_request_size(self, val):
+        self._max_read_request_size = val
+        self.upstream_bridge.pcie_cap.max_read_request_size = val
 
-    def find_region(self, addr):
-        for region in self.regions:
-            if region[0] <= addr < region[0]+region[1]:
-                return region
-        return None
+    @property
+    def read_completion_boundary(self):
+        return self._read_completion_boundary
 
-    def find_io_region(self, addr):
-        for region in self.io_regions:
-            if region[0] <= addr < region[0]+region[1]:
-                return region
-        return None
+    @read_completion_boundary.setter
+    def read_completion_boundary(self, val):
+        self._read_completion_boundary = val
+        self.upstream_bridge.pcie_cap.read_completion_boundary = val
+
+    def alloc_region(self, size):
+        region = self.mem_pool.alloc_region(size)
+        return region.get_absolute_address(0), region.mem
+
+    def alloc_io_region(self, size):
+        region = self.io_pool.alloc_region(size)
+        return region.get_absolute_address(0), region.mem
 
     async def read_region(self, addr, length):
-        region = self.find_region(addr)
-        if not region:
-            raise Exception("Invalid address")
-        offset = addr - region[0]
-        if len(region) == 3:
-            return region[2][offset:offset+length]
-        elif len(region) == 4:
-            return await region[2](offset, length)
+        return await self.mem_region.read(addr, length)
 
     async def write_region(self, addr, data):
-        region = self.find_region(addr)
-        if not region:
-            raise Exception("Invalid address")
-        offset = addr - region[0]
-        if len(region) == 3:
-            region[2][offset:offset+len(data)] = data
-        elif len(region) == 4:
-            await region[3](offset, data)
+        await self.mem_region.write(addr, data)
 
     async def read_io_region(self, addr, length):
-        region = self.find_io_region(addr)
-        if not region:
-            raise Exception("Invalid address")
-        offset = addr - region[0]
-        if len(region) == 3:
-            return region[2][offset:offset+length]
-        elif len(region) == 4:
-            return await region[2](offset, length)
+        return await self.io_region.read(addr, length)
 
     async def write_io_region(self, addr, data):
-        region = self.find_io_region(addr)
-        if not region:
-            raise Exception("Invalid address")
-        offset = addr - region[0]
-        if len(region) == 3:
-            region[2][offset:offset+len(data)] = data
-        elif len(region) == 4:
-            await region[3](offset, data)
+        await self.io_region.write(addr, data)
 
     async def downstream_send(self, tlp):
-        self.log.debug("Sending TLP: %s", repr(tlp))
+        self.log.debug("Sending TLP: %r", tlp)
         assert tlp.check()
         await self.upstream_bridge.upstream_recv(tlp)
 
@@ -200,7 +201,7 @@ class RootComplex(Switch):
         await self.downstream_send(tlp)
 
     async def downstream_recv(self, tlp):
-        self.log.debug("Got TLP: %s", repr(tlp))
+        self.log.debug("Got TLP: %r", tlp)
         assert tlp.check()
         await self.handle_tlp(tlp)
 
@@ -260,246 +261,344 @@ class RootComplex(Switch):
         self.tag_active[tag] = False
         self.tag_release.set()
 
+    async def perform_posted_operation(self, req):
+        await self.send(req)
+
+    async def perform_nonposted_operation(self, req, timeout=0, timeout_unit='ns'):
+        completions = []
+
+        req.tag = await self.alloc_tag()
+
+        await self.send(req)
+
+        while True:
+            cpl = await self.recv_cpl(req.tag, timeout, timeout_unit)
+
+            if not cpl:
+                break
+
+            completions.append(cpl)
+
+            if cpl.status != CplStatus.SC:
+                # bad status
+                break
+            elif req.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
+                # completion for memory read request
+
+                # request completed
+                if cpl.byte_count <= cpl.length*4 - (cpl.lower_address & 0x3):
+                    break
+
+                # completion for read request has SC status but no data
+                if cpl.fmt_type in {TlpType.CPL, TlpType.CPL_LOCKED}:
+                    break
+
+            else:
+                # completion for other request
+                break
+
+        self.release_tag(req.tag)
+
+        return completions
+
     async def handle_io_read_tlp(self, tlp):
-        if self.find_io_region(tlp.address):
-            self.log.info("IO read, address 0x%08x, BE 0x%x, tag %d",
+        self.log.info("IO read, address 0x%08x, BE 0x%x, tag %d",
                 tlp.address, tlp.first_be, tlp.tag)
 
-            assert tlp.length == 1
-
-            # prepare completion TLP
-            cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
-
-            addr = tlp.address
-            offset = 0
-            start_offset = None
-            mask = tlp.first_be
-
-            # perform read
-            data = bytearray(4)
-
-            for k in range(4):
-                if mask & (1 << k):
-                    if start_offset is None:
-                        start_offset = offset
-                else:
-                    if start_offset is not None and offset != start_offset:
-                        data[start_offset:offset] = await self.read_io_region(addr+start_offset, offset-start_offset)
-                    start_offset = None
-
-                offset += 1
-
-            if start_offset is not None and offset != start_offset:
-                data[start_offset:offset] = await self.read_io_region(addr+start_offset, offset-start_offset)
-
-            cpl.set_data(data)
-            cpl.byte_count = 4
-            cpl.length = 1
-
-            self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
-        else:
-            self.log.warning("IO request did not match any regions")
+        if not self.io_address_space.find_regions(tlp.address, tlp.length*4):
+            self.log.warning("IO request did not match any regions: %r", tlp)
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
-            self.log.debug("UR Completion: %s", repr(cpl))
+            self.log.debug("UR Completion: %r", cpl)
             await self.send(cpl)
+            return
 
-    async def handle_io_write_tlp(self, tlp):
-        if self.find_io_region(tlp.address):
-            self.log.info("IO write, address 0x%08x, BE 0x%x, tag %d, data 0x%08x",
-                tlp.address, tlp.first_be, tlp.tag, int.from_bytes(tlp.get_data(), 'little'))
+        assert tlp.length == 1
 
-            assert tlp.length == 1
+        # prepare completion TLP
+        cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
 
-            # prepare completion TLP
-            cpl = Tlp.create_completion_for_tlp(tlp, PcieId(0, 0, 0))
+        addr = tlp.address
+        offset = 0
+        start_offset = None
+        mask = tlp.first_be
 
-            addr = tlp.address
-            offset = 0
-            start_offset = None
-            mask = tlp.first_be
+        # generate operation list
+        read_ops = []
 
-            # perform write
-            data = tlp.get_data()
+        data = bytearray(4)
 
-            for k in range(4):
-                if mask & (1 << k):
-                    if start_offset is None:
-                        start_offset = offset
-                else:
-                    if start_offset is not None and offset != start_offset:
-                        await self.write_io_region(addr+start_offset, data[start_offset:offset])
-                    start_offset = None
-
-                offset += 1
-
-            if start_offset is not None and offset != start_offset:
-                await self.write_io_region(addr+start_offset, data[start_offset:offset])
-
-            cpl.byte_count = 4
-
-            self.log.debug("Completion: %s", repr(cpl))
-            await self.send(cpl)
-
-        else:
-            self.log.warning("IO request did not match any regions")
-
-            # Unsupported request
-            cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
-            self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
-
-    async def handle_mem_read_tlp(self, tlp):
-        if self.find_region(tlp.address):
-            self.log.info("Memory read, address 0x%08x, length %d, BE 0x%x/0x%x, tag %d",
-                tlp.address, tlp.length, tlp.first_be, tlp.last_be, tlp.tag)
-
-            # perform operation
-            addr = tlp.address
-
-            # check for 4k boundary crossing
-            if tlp.length*4 > 0x1000 - (addr & 0xfff):
-                self.log.warning("Request crossed 4k boundary, discarding request")
-                return
-
-            # perform read
-            data = await self.read_region(addr, tlp.length*4)
-
-            # prepare completion TLP(s)
-            m = 0
-            n = 0
-            addr = tlp.address+tlp.get_first_be_offset()
-            dw_length = tlp.length
-            byte_length = tlp.get_be_byte_count()
-
-            while m < dw_length:
-                cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
-
-                cpl_dw_length = dw_length - m
-                cpl_byte_length = byte_length - n
-                cpl.byte_count = cpl_byte_length
-                if cpl_dw_length > 32 << self.max_payload_size:
-                    cpl_dw_length = 32 << self.max_payload_size  # max payload size
-                    cpl_dw_length -= (addr & 0x7c) >> 2  # RCB align
-
-                cpl.lower_address = addr & 0x7f
-
-                cpl.set_data(data[m*4:(m+cpl_dw_length)*4])
-
-                self.log.debug("Completion: %s", repr(cpl))
-                await self.send(cpl)
-
-                m += cpl_dw_length
-                n += cpl_dw_length*4 - (addr & 3)
-                addr += cpl_dw_length*4 - (addr & 3)
-
-        else:
-            self.log.warning("Memory request did not match any regions")
-
-            # Unsupported request
-            cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
-            self.log.debug("UR Completion: %s", repr(cpl))
-            await self.send(cpl)
-
-    async def handle_mem_write_tlp(self, tlp):
-        if self.find_region(tlp.address):
-            self.log.info("Memory write, address 0x%08x, length %d, BE 0x%x/0x%x",
-                tlp.address, tlp.length, tlp.first_be, tlp.last_be)
-
-            # perform operation
-            addr = tlp.address
-            offset = 0
-            start_offset = None
-            mask = tlp.first_be
-
-            # check for 4k boundary crossing
-            if tlp.length*4 > 0x1000 - (addr & 0xfff):
-                self.log.warning("Request crossed 4k boundary, discarding request")
-                return
-
-            # perform write
-            data = tlp.get_data()
-
-            # first dword
-            for k in range(4):
-                if mask & (1 << k):
-                    if start_offset is None:
-                        start_offset = offset
-                else:
-                    if start_offset is not None and offset != start_offset:
-                        await self.write_region(addr+start_offset, data[start_offset:offset])
-                    start_offset = None
-
-                offset += 1
-
-            if tlp.length > 2:
-                # middle dwords
+        for k in range(4):
+            if mask & (1 << k):
                 if start_offset is None:
                     start_offset = offset
-                offset += (tlp.length-2)*4
+            else:
+                if start_offset is not None and offset != start_offset:
+                    read_ops.append((start_offset, addr+start_offset, offset-start_offset))
+                start_offset = None
 
-            if tlp.length > 1:
-                # last dword
-                mask = tlp.last_be
+            offset += 1
 
-                for k in range(4):
-                    if mask & (1 << k):
-                        if start_offset is None:
-                            start_offset = offset
-                    else:
-                        if start_offset is not None and offset != start_offset:
-                            await self.write_region(addr+start_offset, data[start_offset:offset])
-                        start_offset = None
+        if start_offset is not None and offset != start_offset:
+            read_ops.append((start_offset, addr+start_offset, offset-start_offset))
 
-                    offset += 1
+        # perform reads
+        try:
+            for offset, addr, length in read_ops:
+                data[offset:offset+length] = await self.io_address_space.read(addr, length)
+        except Exception:
+            self.log.warning("IO read operation failed: %r", tlp)
 
-            if start_offset is not None and offset != start_offset:
-                await self.write_region(addr+start_offset, data[start_offset:offset])
+            # Completer abort
+            cpl = Tlp.create_ca_completion_for_tlp(tlp, PcieId(0, 0, 0))
+            self.log.debug("CA Completion: %r", cpl)
+            await self.send(cpl)
+            return
 
-            # memory writes are posted, so don't send a completion
+        cpl.set_data(data)
+        cpl.byte_count = 4
+        cpl.length = 1
 
-        else:
-            self.log.warning("Memory request did not match any regions")
+        self.log.debug("Completion: %r", cpl)
+        await self.send(cpl)
+
+    async def handle_io_write_tlp(self, tlp):
+        self.log.info("IO write, address 0x%08x, BE 0x%x, tag %d, data 0x%08x",
+                tlp.address, tlp.first_be, tlp.tag, int.from_bytes(tlp.get_data(), 'little'))
+
+        if not self.io_address_space.find_regions(tlp.address, tlp.length*4):
+            self.log.warning("IO request did not match any regions: %r", tlp)
+
+            # Unsupported request
+            cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
+            self.log.debug("UR Completion: %r", cpl)
+            await self.send(cpl)
+            return
+
+        assert tlp.length == 1
+
+        # prepare completion TLP
+        cpl = Tlp.create_completion_for_tlp(tlp, PcieId(0, 0, 0))
+
+        addr = tlp.address
+        offset = 0
+        start_offset = None
+        mask = tlp.first_be
+
+        # generate operation list
+        write_ops = []
+
+        data = tlp.get_data()
+
+        for k in range(4):
+            if mask & (1 << k):
+                if start_offset is None:
+                    start_offset = offset
+            else:
+                if start_offset is not None and offset != start_offset:
+                    write_ops.append((addr+start_offset, data[start_offset:offset]))
+                start_offset = None
+
+            offset += 1
+
+        if start_offset is not None and offset != start_offset:
+            write_ops.append((addr+start_offset, data[start_offset:offset]))
+
+        # perform writes
+        try:
+            for addr, data in write_ops:
+                await self.io_address_space.write(addr, data)
+        except Exception:
+            self.log.warning("IO write operation failed: %r", tlp)
+
+            # Completer abort
+            cpl = Tlp.create_ca_completion_for_tlp(tlp, PcieId(0, 0, 0))
+            self.log.debug("CA Completion: %r", cpl)
+            await self.send(cpl)
+            return
+
+        cpl.byte_count = 4
+
+        self.log.debug("Completion: %r", cpl)
+        await self.send(cpl)
+
+    async def handle_mem_read_tlp(self, tlp):
+        self.log.info("Memory read, address 0x%08x, length %d, BE 0x%x/0x%x, tag %d",
+                tlp.address, tlp.length, tlp.first_be, tlp.last_be, tlp.tag)
+
+        if not self.mem_address_space.find_regions(tlp.address, tlp.length*4):
+            self.log.warning("Memory request did not match any regions: %r", tlp)
+
+            # Unsupported request
+            cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(0, 0, 0))
+            self.log.debug("UR Completion: %r", cpl)
+            await self.send(cpl)
+            return
+
+        # perform operation
+        addr = tlp.address
+
+        # check for 4k boundary crossing
+        if tlp.length*4 > 0x1000 - (addr & 0xfff):
+            self.log.warning("Request crossed 4k boundary, discarding request")
+            return
+
+        # perform read
+        try:
+            data = await self.mem_address_space.read(addr, tlp.length*4)
+        except Exception:
+            self.log.warning("Memory read operation failed: %r", tlp)
+
+            # Completer abort
+            cpl = Tlp.create_ca_completion_for_tlp(tlp, PcieId(0, 0, 0))
+            self.log.debug("CA Completion: %r", cpl)
+            await self.send(cpl)
+            return
+
+        # prepare completion TLP(s)
+        m = 0
+        n = 0
+        addr = tlp.address+tlp.get_first_be_offset()
+        dw_length = tlp.length
+        byte_length = tlp.get_be_byte_count()
+        max_payload_dw = 32 << self.max_payload_size
+        rcb = 64
+        if self.read_completion_boundary:
+            rcb = 128
+        rcb_mask = (rcb-1) & 0xfc
+
+        while m < dw_length:
+            cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
+
+            cpl_dw_length = dw_length - m
+            cpl.byte_count = byte_length - n
+            if self.split_on_all_rcb:
+                # split on every RCB
+                cpl_dw_length = min(cpl_dw_length, (rcb - (addr & rcb_mask)) >> 2);
+            else:
+                # produce largest possible TLPs
+                if cpl_dw_length > max_payload_dw:
+                    cpl_dw_length = max_payload_dw - ((addr & rcb_mask) >> 2)
+
+            cpl.lower_address = addr & 0x7f
+
+            cpl.set_data(data[m*4:(m+cpl_dw_length)*4])
+
+            self.log.debug("Completion: %r", cpl)
+            await self.send(cpl)
+
+            m += cpl_dw_length
+            n += cpl_dw_length*4 - (addr & 3)
+            addr += cpl_dw_length*4 - (addr & 3)
+
+    async def handle_mem_write_tlp(self, tlp):
+        self.log.info("Memory write, address 0x%08x, length %d, BE 0x%x/0x%x",
+                tlp.address, tlp.length, tlp.first_be, tlp.last_be)
+
+        if not self.mem_address_space.find_regions(tlp.address, tlp.length*4):
+            self.log.warning("Memory request did not match any regions: %r", tlp)
+            return
+
+        # perform operation
+        addr = tlp.address
+        offset = 0
+        start_offset = None
+        mask = tlp.first_be
+
+        # check for 4k boundary crossing
+        if tlp.length*4 > 0x1000 - (addr & 0xfff):
+            self.log.warning("Request crossed 4k boundary, discarding request")
+            return
+
+        # generate operation list
+        write_ops = []
+
+        data = tlp.get_data()
+
+        # first dword
+        for k in range(4):
+            if mask & (1 << k):
+                if start_offset is None:
+                    start_offset = offset
+            else:
+                if start_offset is not None and offset != start_offset:
+                    write_ops.append((addr+start_offset, data[start_offset:offset]))
+                start_offset = None
+
+            offset += 1
+
+        if tlp.length > 2:
+            # middle dwords
+            if start_offset is None:
+                start_offset = offset
+            offset += (tlp.length-2)*4
+
+        if tlp.length > 1:
+            # last dword
+            mask = tlp.last_be
+
+            for k in range(4):
+                if mask & (1 << k):
+                    if start_offset is None:
+                        start_offset = offset
+                else:
+                    if start_offset is not None and offset != start_offset:
+                        write_ops.append((addr+start_offset, data[start_offset:offset]))
+                    start_offset = None
+
+                offset += 1
+
+        if start_offset is not None and offset != start_offset:
+            write_ops.append((addr+start_offset, data[start_offset:offset]))
+
+        # perform writes
+        try:
+            for addr, data in write_ops:
+                await self.mem_address_space.write(addr, data)
+        except Exception:
+            self.log.warning("Memory write operation failed: %r", tlp)
+            return
+
+        # memory writes are posted, so don't send a completion
 
     async def config_read(self, dev, addr, length, timeout=0, timeout_unit='ns'):
         n = 0
-        data = b''
+        data = bytearray()
 
-        while True:
-            tlp = Tlp()
-            tlp.fmt_type = TlpType.CFG_READ_1
-            tlp.requester_id = PcieId(0, 0, 0)
-            tlp.dest_id = dev
+        while n < length:
+            req = Tlp()
+            req.fmt_type = TlpType.CFG_READ_1
+            req.requester_id = PcieId(0, 0, 0)
+            req.completer_id = dev
 
             first_pad = addr % 4
             byte_length = min(length-n, 4-first_pad)
-            tlp.set_addr_be(addr, byte_length)
+            req.set_addr_be(addr, byte_length)
 
-            tlp.register_number = addr >> 2
+            cpl_list = await self.perform_nonposted_operation(req, timeout, timeout_unit)
 
-            tlp.tag = await self.alloc_tag()
-
-            await self.send(tlp)
-            cpl = await self.recv_cpl(tlp.tag, timeout, timeout_unit)
-
-            self.release_tag(tlp.tag)
-
-            if not cpl or cpl.status != CplStatus.SC:
+            if not cpl_list:
+                # timed out
+                d = b'\xff\xff\xff\xff'
+            elif cpl_list[0].status == CplStatus.CRS and req.address == 0 and cpl_list[0].ingress_port:
+                # completion retry status
+                if cpl_list[0].ingress_port.pcie_cap.crs_software_visibility_enable:
+                    d = b'\x01\x00\xff\xff'
+                else:
+                    d = b'\xff\xff\xff\xff'
+            elif cpl_list[0].status != CplStatus.SC:
+                # unsupported request or completer abort status
                 d = b'\xff\xff\xff\xff'
             else:
-                assert cpl.length == 1
-                d = cpl.get_data()
+                # success
+                assert cpl_list[0].length == 1
+                d = cpl_list[0].get_data()
 
-            data += d[first_pad:]
+            data.extend(d[first_pad:])
 
             n += byte_length
             addr += byte_length
-
-            if n >= length:
-                break
 
         return data[:length]
 
@@ -531,30 +630,20 @@ class RootComplex(Switch):
     async def config_write(self, dev, addr, data, timeout=0, timeout_unit='ns'):
         n = 0
 
-        while True:
-            tlp = Tlp()
-            tlp.fmt_type = TlpType.CFG_WRITE_1
-            tlp.requester_id = PcieId(0, 0, 0)
-            tlp.dest_id = dev
+        while n < len(data):
+            req = Tlp()
+            req.fmt_type = TlpType.CFG_WRITE_1
+            req.requester_id = PcieId(0, 0, 0)
+            req.completer_id = dev
 
             first_pad = addr % 4
             byte_length = min(len(data)-n, 4-first_pad)
-            tlp.set_addr_be_data(addr, data[n:n+byte_length])
+            req.set_addr_be_data(addr, data[n:n+byte_length])
 
-            tlp.register_number = addr >> 2
-
-            tlp.tag = await self.alloc_tag()
-
-            await self.send(tlp)
-            await self.recv_cpl(tlp.tag, timeout, timeout_unit)
-
-            self.release_tag(tlp.tag)
+            cpl_list = await self.perform_nonposted_operation(req, timeout, timeout_unit)
 
             n += byte_length
             addr += byte_length
-
-            if n >= len(data):
-                break
 
     async def config_write_words(self, dev, addr, data, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         words = data
@@ -582,7 +671,7 @@ class RootComplex(Switch):
         await self.config_write_qwords(dev, addr, [data], byteorder, timeout, timeout_unit)
 
     async def capability_read(self, dev, cap_id, addr, length, timeout=0, timeout_unit='ns'):
-        ti = self.tree.find_child_dev(dev)
+        ti = self.host_bridge.find_child_dev(dev)
 
         if not ti:
             raise Exception("Device not found")
@@ -620,7 +709,7 @@ class RootComplex(Switch):
         return (await self.capability_read_qwords(dev, cap_id, addr, 1, byteorder, timeout, timeout_unit))[0]
 
     async def capability_write(self, dev, cap_id, addr, data, timeout=0, timeout_unit='ns'):
-        ti = self.tree.find_child_dev(dev)
+        ti = self.host_bridge.find_child_dev(dev)
 
         if not ti:
             raise Exception("Device not found")
@@ -658,46 +747,7 @@ class RootComplex(Switch):
         await self.capability_write_qwords(dev, cap_id, addr, [data], byteorder, timeout, timeout_unit)
 
     async def io_read(self, addr, length, timeout=0, timeout_unit='ns'):
-        n = 0
-        data = b''
-
-        if self.find_region(addr):
-            val = await self.read_io_region(addr, length)
-            return val
-
-        while True:
-            tlp = Tlp()
-            tlp.fmt_type = TlpType.IO_READ
-            tlp.requester_id = PcieId(0, 0, 0)
-
-            first_pad = addr % 4
-            byte_length = min(length-n, 4-first_pad)
-            tlp.set_addr_be(addr, byte_length)
-
-            tlp.tag = await self.alloc_tag()
-
-            await self.send(tlp)
-            cpl = await self.recv_cpl(tlp.tag, timeout, timeout_unit)
-
-            self.release_tag(tlp.tag)
-
-            if not cpl:
-                raise Exception("Timeout")
-            if cpl.status != CplStatus.SC:
-                raise Exception("Unsuccessful completion")
-            else:
-                assert cpl.length == 1
-                d = cpl.get_data()
-
-            data += d[first_pad:]
-
-            n += byte_length
-            addr += byte_length
-
-            if n >= length:
-                break
-
-        return data[:length]
+        return await self.io_address_space.read(addr, length, timeout=timeout, timeout_unit=timeout_unit)
 
     async def io_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         data = await self.io_read(addr, count*ws, timeout, timeout_unit)
@@ -725,38 +775,7 @@ class RootComplex(Switch):
         return (await self.io_read_qwords(addr, 1, byteorder, timeout, timeout_unit))[0]
 
     async def io_write(self, addr, data, timeout=0, timeout_unit='ns'):
-        n = 0
-
-        if self.find_region(addr):
-            await self.write_io_region(addr, data)
-            return
-
-        while True:
-            tlp = Tlp()
-            tlp.fmt_type = TlpType.IO_WRITE
-            tlp.requester_id = PcieId(0, 0, 0)
-
-            first_pad = addr % 4
-            byte_length = min(len(data)-n, 4-first_pad)
-            tlp.set_addr_be_data(addr, data[n:n+byte_length])
-
-            tlp.tag = await self.alloc_tag()
-
-            await self.send(tlp)
-            cpl = await self.recv_cpl(tlp.tag, timeout, timeout_unit)
-
-            self.release_tag(tlp.tag)
-
-            if not cpl:
-                raise Exception("Timeout")
-            if cpl.status != CplStatus.SC:
-                raise Exception("Unsuccessful completion")
-
-            n += byte_length
-            addr += byte_length
-
-            if n >= len(data):
-                break
+        await self.io_address_space.write(addr, data, timeout=timeout, timeout_unit=timeout_unit)
 
     async def io_write_words(self, addr, data, byteorder='little', ws=2, timeout=0, timeout_unit='ns'):
         words = data
@@ -784,72 +803,7 @@ class RootComplex(Switch):
         await self.io_write_qwords(addr, [data], byteorder, timeout, timeout_unit)
 
     async def mem_read(self, addr, length, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
-        n = 0
-        data = b''
-
-        if self.find_region(addr):
-            val = await self.read_region(addr, length)
-            return val
-
-        while True:
-            tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_READ_64
-            else:
-                tlp.fmt_type = TlpType.MEM_READ
-            tlp.requester_id = PcieId(0, 0, 0)
-            tlp.attr = attr
-            tlp.tc = tc
-
-            first_pad = addr % 4
-            # remaining length
-            byte_length = length-n
-            # limit to max read request size
-            if byte_length > (128 << self.max_read_request_size) - first_pad:
-                # split on 128-byte read completion boundary
-                byte_length = min(byte_length, (128 << self.max_read_request_size) - (addr & 0x1f))
-            # 4k align
-            byte_length = min(byte_length, 0x1000 - (addr & 0xfff))
-            tlp.set_addr_be(addr, byte_length)
-
-            tlp.tag = await self.alloc_tag()
-
-            await self.send(tlp)
-
-            m = 0
-
-            while True:
-                cpl = await self.recv_cpl(tlp.tag, timeout, timeout_unit)
-
-                if not cpl:
-                    self.release_tag(tlp.tag)
-                    raise Exception("Timeout")
-                if cpl.status != CplStatus.SC:
-                    self.release_tag(tlp.tag)
-                    raise Exception("Unsuccessful completion")
-                else:
-                    assert cpl.byte_count+3+(cpl.lower_address & 3) >= cpl.length*4
-                    assert cpl.byte_count == max(byte_length - m, 1)
-
-                    d = cpl.get_data()
-
-                    offset = cpl.lower_address & 3
-                    data += d[offset:offset+cpl.byte_count]
-
-                m += len(d)-offset
-
-                if m >= byte_length:
-                    break
-
-            self.release_tag(tlp.tag)
-
-            n += byte_length
-            addr += byte_length
-
-            if n >= length:
-                break
-
-        return data[:length]
+        return await self.mem_address_space.read(addr, length, timeout=timeout, timeout_unit=timeout_unit, attr=attr, tc=tc)
 
     async def mem_read_words(self, addr, count, byteorder='little', ws=2, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         data = await self.mem_read(addr, count*ws, timeout, timeout_unit, attr, tc)
@@ -877,35 +831,7 @@ class RootComplex(Switch):
         return (await self.mem_read_qwords(addr, 1, byteorder, timeout, timeout_unit, attr, tc))[0]
 
     async def mem_write(self, addr, data, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
-        n = 0
-
-        if self.find_region(addr):
-            await self.write_region(addr, data)
-            return
-
-        while True:
-            tlp = Tlp()
-            if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_WRITE_64
-            else:
-                tlp.fmt_type = TlpType.MEM_WRITE
-            tlp.requester_id = PcieId(0, 0, 0)
-            tlp.attr = attr
-            tlp.tc = tc
-
-            first_pad = addr % 4
-            byte_length = len(data)-n
-            byte_length = min(byte_length, (128 << self.max_payload_size)-first_pad)  # max payload size
-            byte_length = min(byte_length, 0x1000 - (addr & 0xfff))  # 4k align
-            tlp.set_addr_be_data(addr, data[n:n+byte_length])
-
-            await self.send(tlp)
-
-            n += byte_length
-            addr += byte_length
-
-            if n >= len(data):
-                break
+        await self.mem_address_space.write(addr, data, timeout=timeout, timeout_unit=timeout_unit, attr=attr, tc=tc)
 
     async def mem_write_words(self, addr, data, byteorder='little', ws=2, timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         words = data
@@ -932,492 +858,34 @@ class RootComplex(Switch):
     async def mem_write_qword(self, addr, data, byteorder='little', timeout=0, timeout_unit='ns', attr=TlpAttr(0), tc=TlpTc.TC0):
         await self.mem_write_qwords(addr, [data], byteorder, timeout, timeout_unit, attr, tc)
 
-    async def msi_region_read(self, addr, length):
-        return b'\x00'*length
+    def msi_alloc_vectors(self, num):
+        return self.msi_region.alloc_vectors(num)
 
-    async def msi_region_write(self, addr, data):
-        assert addr == 0
-        assert len(data) == 4
-        number, = struct.unpack('<L', data)
-        self.log.info("MSI interrupt: 0x%08x, 0x%04x", addr, number)
-        assert number in self.msi_events
-        for event in self.msi_events[number]:
-            event.set()
-        for cb in self.msi_callbacks[number]:
-            cocotb.fork(cb())
+    def find_device(self, pcie_id):
+        return self.host_bridge.find_device(pcie_id)
 
-    async def configure_msi(self, dev):
-        if self.msi_addr is None:
-            self.msi_addr, _ = self.alloc_region(4, self.msi_region_read, self.msi_region_write)
-        if not self.tree:
-            raise Exception("Enumeration has not yet been run")
-        ti = self.tree.find_child_dev(dev)
-        if not ti:
-            raise Exception("Invalid device")
-        if ti.get_capability_offset(PcieCapId.MSI) is None:
-            raise Exception("Device does not support MSI")
-        if ti.msi_addr is not None and ti.msi_data is not None:
-            # already configured
-            return
-
-        self.log.info("Configure MSI on %s", ti.pcie_id)
-
-        msg_ctrl = await self.capability_read_dword(dev, PcieCapId.MSI, 0)
-
-        msi_64bit = msg_ctrl >> 23 & 1
-        msi_mmcap = msg_ctrl >> 17 & 7
-
-        # message address
-        await self.capability_write_dword(dev, PcieCapId.MSI, 4, self.msi_addr & 0xfffffffc)
-
-        if msi_64bit:
-            # 64 bit message address
-            # message upper address
-            await self.capability_write_dword(dev, PcieCapId.MSI, 8, (self.msi_addr >> 32) & 0xffffffff)
-            # message data
-            await self.capability_write_dword(dev, PcieCapId.MSI, 12, self.msi_msg_limit)
-
-        else:
-            # 32 bit message address
-            # message data
-            await self.capability_write_dword(dev, PcieCapId.MSI, 8, self.msi_msg_limit)
-
-        # enable and set enabled messages
-        await self.capability_write_dword(dev, PcieCapId.MSI, 0, (msg_ctrl & ~(7 << 20)) | 1 << 16 | msi_mmcap << 20)
-
-        ti.msi_count = 2**msi_mmcap
-        ti.msi_addr = self.msi_addr
-        ti.msi_data = self.msi_msg_limit
-
-        self.log.info("MSI count: %d", ti.msi_count)
-        self.log.info("MSI address: 0x%08x", ti.msi_addr)
-        self.log.info("MSI base data: 0x%08x", ti.msi_data)
-
-        for k in range(32):
-            self.msi_events[self.msi_msg_limit] = [Event()]
-            self.msi_callbacks[self.msi_msg_limit] = []
-            self.msi_msg_limit += 1
-
-    def msi_get_event(self, dev, number=0):
-        if not self.tree:
-            return None
-        ti = self.tree.find_child_dev(dev)
-        if not ti:
-            raise Exception("Invalid device")
-        if ti.msi_data is None:
-            raise Exception("MSI not configured on device")
-        if number < 0 or number >= ti.msi_count or ti.msi_data+number not in self.msi_events:
-            raise Exception("MSI number out of range")
-        return self.msi_events[ti.msi_data+number][0]
-
-    def msi_register_event(self, dev, event, number=0):
-        if not self.tree:
-            return
-        ti = self.tree.find_child_dev(dev)
-        if not ti:
-            raise Exception("Invalid device")
-        if ti.msi_data is None:
-            raise Exception("MSI not configured on device")
-        if number < 0 or number >= ti.msi_count or ti.msi_data+number not in self.msi_events:
-            raise Exception("MSI number out of range")
-        self.msi_events[ti.msi_data+number].append(event)
-
-    def msi_register_callback(self, dev, callback, number=0):
-        if not self.tree:
-            return
-        ti = self.tree.find_child_dev(dev)
-        if not ti:
-            raise Exception("Invalid device")
-        if ti.msi_data is None:
-            raise Exception("MSI not configured on device")
-        if number < 0 or number >= ti.msi_count or ti.msi_data+number not in self.msi_callbacks:
-            raise Exception("MSI number out of range")
-        self.msi_callbacks[ti.msi_data+number].append(callback)
-
-    async def enumerate_segment(self, tree, bus, timeout=1000, timeout_unit='ns',
-            enable_bus_mastering=False, configure_msi=False):
-        sec_bus = bus+1
-        sub_bus = bus
-
-        tree.sec_bus_num = bus
-
-        # align limits against bridge registers
-        self.io_limit = align(self.io_limit, 0xfff)
-        self.mem_limit = align(self.mem_limit, 0xfffff)
-        self.prefetchable_mem_limit = align(self.prefetchable_mem_limit, 0xfffff)
-
-        tree.io_base = self.io_limit
-        tree.io_limit = self.io_limit
-        tree.mem_base = self.mem_limit
-        tree.mem_limit = self.mem_limit
-        tree.prefetchable_mem_base = self.prefetchable_mem_limit
-        tree.prefetchable_mem_limit = self.prefetchable_mem_limit
-
-        self.log.info("Enumerating bus %d", bus)
-
-        for d in range(32):
-            if bus == 0 and d == 0:
-                continue
-
-            self.log.info("Enumerating bus %d device %d", bus, d)
-
-            # read vendor ID and device ID
-            val = await self.config_read_dword(PcieId(bus, d, 0), 0x000, 'little', timeout, timeout_unit)
-
-            if val is None or val == 0xffffffff:
-                continue
-
-            # valid vendor ID
-            self.log.info("Found device at %02x:%02x.%x", bus, d, 0)
-
-            for f in range(8):
-                cur_func = PcieId(bus, d, f)
-
-                # read vendor ID and device ID
-                val = await self.config_read_dword(cur_func, 0x000, 'little', timeout, timeout_unit)
-
-                if val is None or val == 0xffffffff:
-                    continue
-
-                ti = TreeItem()
-                tree.children.append(ti)
-                ti.pcie_id = cur_func
-                ti.vendor_id = val & 0xffff
-                ti.device_id = (val >> 16) & 0xffff
-
-                # read header type
-                header_type = await self.config_read_byte(cur_func, 0x00e, timeout, timeout_unit)
-                ti.header_type = header_type
-
-                val = await self.config_read_dword(cur_func, 0x008, 'little', timeout, timeout_unit)
-
-                ti.revision_id = val & 0xff
-                ti.class_code = val >> 8
-
-                self.log.info("Found function at %s", cur_func)
-                self.log.info("Header type: 0x%02x", header_type)
-                self.log.info("Vendor ID: 0x%04x", ti.vendor_id)
-                self.log.info("Device ID: 0x%04x", ti.device_id)
-                self.log.info("Revision ID: 0x%02x", ti.revision_id)
-                self.log.info("Class code: 0x%06x", ti.class_code)
-
-                bridge = header_type & 0x7f == 0x01
-
-                bar_cnt = 6
-
-                if bridge:
-                    # bridge (type 1 header)
-                    self.log.info("Found bridge at %s", cur_func)
-
-                    bar_cnt = 2
-                else:
-                    # normal function (type 0 header)
-                    val = await self.config_read_dword(cur_func, 0x02c)
-                    ti.subsystem_vendor_id = val & 0xffff
-                    ti.subsystem_id = (val >> 16) & 0xffff
-
-                    self.log.info("Subsystem vendor ID: 0x%04x", ti.subsystem_vendor_id)
-                    self.log.info("Subsystem ID: 0x%04x", ti.subsystem_id)
-
-                # configure base address registers
-                bar = 0
-                while bar < bar_cnt:
-                    # read BAR
-                    await self.config_write_dword(cur_func, 0x010+bar*4, 0xffffffff)
-                    val = await self.config_read_dword(cur_func, 0x010+bar*4)
-
-                    if val == 0:
-                        # unimplemented BAR
-                        ti.bar_raw[bar] = 0
-                        bar += 1
-                        continue
-
-                    self.log.info("Configure function %s BAR%d", cur_func, bar)
-
-                    if val & 0x1:
-                        # IO BAR
-                        mask = (~val & 0xffffffff) | 0x3
-                        size = mask + 1
-                        self.log.info("Function %s IO BAR%d raw: 0x%08x, mask: 0x%08x, size: %d",
-                            cur_func, bar, val, mask, size)
-
-                        # align
-                        self.io_limit = align(self.io_limit, mask)
-
-                        addr = self.io_limit
-                        self.io_limit += size
-
-                        val = val & 0x3 | addr
-
-                        ti.bar[bar] = val
-                        ti.bar_raw[bar] = val
-                        ti.bar_addr[bar] = addr
-                        ti.bar_size[bar] = size
-
-                        self.log.info("Function %s IO BAR%d allocation: 0x%08x, raw: 0x%08x, size: %d",
-                            cur_func, bar, addr, val, size)
-
-                        # write BAR
-                        await self.config_write_dword(cur_func, 0x010+bar*4, val)
-
-                        bar += 1
-
-                    elif val & 0x4:
-                        # 64 bit memory BAR
-                        if bar >= bar_cnt-1:
-                            raise Exception("Invalid BAR configuration")
-
-                        # read adjacent BAR
-                        await self.config_write_dword(cur_func, 0x010+(bar+1)*4, 0xffffffff)
-                        val2 = await self.config_read_dword(cur_func, 0x010+(bar+1)*4)
-                        val |= val2 << 32
-                        mask = (~val & 0xffffffffffffffff) | 0xf
-                        size = mask + 1
-                        self.log.info("Function %s Mem BAR%d (64-bit) raw: 0x%016x, mask: 0x%016x, size: %d",
-                            cur_func, bar, val, mask, size)
-
-                        if val & 0x8:
-                            # prefetchable
-                            # align and allocate
-                            self.prefetchable_mem_limit = align(self.prefetchable_mem_limit, mask)
-                            addr = self.prefetchable_mem_limit
-                            self.prefetchable_mem_limit += size
-
-                        else:
-                            # not-prefetchable
-                            self.log.info("Function %s Mem BAR%d (64-bit) marked non-prefetchable, "
-                                "allocating from 32-bit non-prefetchable address space", cur_func, bar)
-                            # align and allocate
-                            self.mem_limit = align(self.mem_limit, mask)
-                            addr = self.mem_limit
-                            self.mem_limit += size
-
-                        val = val & 0xf | addr
-
-                        ti.bar[bar] = val
-                        ti.bar_raw[bar] = val & 0xffffffff
-                        ti.bar_raw[bar+1] = (val >> 32) & 0xffffffff
-                        ti.bar_addr[bar] = addr
-                        ti.bar_size[bar] = size
-
-                        self.log.info("Function %s Mem BAR%d (64-bit) allocation: 0x%016x, raw: 0x%016x, size: %d",
-                            cur_func, bar, addr, val, size)
-
-                        # write BAR
-                        await self.config_write_dword(cur_func, 0x010+bar*4, val & 0xffffffff)
-                        await self.config_write_dword(cur_func, 0x010+(bar+1)*4, (val >> 32) & 0xffffffff)
-
-                        bar += 2
-
-                    else:
-                        # 32 bit memory BAR
-                        mask = (~val & 0xffffffff) | 0xf
-                        size = mask + 1
-                        self.log.info("Function %s Mem BAR%d (32-bit) raw: 0x%08x, mask: 0x%08x, size: %d",
-                            cur_func, bar, val, mask, size)
-
-                        if val & 0x8:
-                            # prefetchable
-                            self.log.info("Function %s Mem BAR%d (32-bit) marked prefetchable, "
-                                "but allocating as non-prefetchable", cur_func, bar)
-
-                        # align and allocate
-                        self.mem_limit = align(self.mem_limit, mask)
-                        addr = self.mem_limit
-                        self.mem_limit += size
-
-                        val = val & 0xf | addr
-
-                        ti.bar[bar] = val
-                        ti.bar_raw[bar] = val
-                        ti.bar_addr[bar] = addr
-                        ti.bar_size[bar] = size
-
-                        self.log.info("Function %s Mem BAR%d (32-bit) allocation: 0x%08x, raw: 0x%08x, size: %d",
-                            cur_func, bar, addr, val, size)
-
-                        # write BAR
-                        await self.config_write_dword(cur_func, 0x010+bar*4, val)
-
-                        bar += 1
-
-                # configure expansion ROM
-
-                # read register
-                await self.config_write_dword(cur_func, 0x038 if bridge else 0x30, 0xfffff800)
-                val = await self.config_read_dword(cur_func, 0x038 if bridge else 0x30)
-
-                if val:
-                    self.log.info("Configure function %s expansion ROM", cur_func)
-
-                    mask = (~val & 0xffffffff) | 0x7ff
-                    size = mask + 1
-                    self.log.info("Function %s expansion ROM raw: 0x%08x, mask: 0x%08x, size: %d",
-                        cur_func, val, mask, size)
-
-                    # align and allocate
-                    self.mem_limit = align(self.mem_limit, mask)
-                    addr = self.mem_limit
-                    self.mem_limit += size
-
-                    val = val & 15 | addr
-
-                    ti.expansion_rom_raw = val
-                    ti.expansion_rom_addr = addr
-                    ti.expansion_rom_size = size
-
-                    self.log.info("Function %s expansion ROM allocation: 0x%08x, raw: 0x%08x, size: %d",
-                        cur_func, addr, val, size)
-
-                    # write register
-                    await self.config_write_dword(cur_func, 0x038 if bridge else 0x30, val)
-                else:
-                    # not implemented
-                    ti.expansion_rom_raw = 0
-
-                self.log.info("Walk capabilities of function %s", cur_func)
-
-                # walk capabilities
-                ptr = await self.config_read_byte(cur_func, 0x34)
-                ptr = ptr & 0xfc
-
-                while ptr > 0:
-                    val = await self.config_read(cur_func, ptr, 2)
-
-                    cap_id = val[0]
-                    next_ptr = val[1] & 0xfc
-
-                    self.log.info("Found capability ID 0x%02x at offset 0x%02x, next ptr 0x%02x",
-                        cap_id, ptr, next_ptr)
-
-                    ti.capabilities.append((cap_id, ptr))
-                    ptr = next_ptr
-
-                # walk extended capabilities
-                ptr = 0x100
-
-                while True:
-                    val = await self.config_read_dword(cur_func, ptr)
-                    if not val:
-                        break
-
-                    cap_id = val & 0xffff
-                    cap_ver = (val >> 16) & 0xf
-                    next_ptr = (val >> 20) & 0xffc
-
-                    self.log.info("Found extended capability ID 0x%04x version %d at offset 0x%03x, next ptr 0x%03x",
-                        cap_id, cap_ver, ptr, next_ptr)
-
-                    ti.ext_capabilities.append((cap_id, ptr))
-                    ptr = next_ptr
-
-                # set max payload size, max read request size, and extended tag enable
-                dev_cap = await self.capability_read_dword(cur_func, PcieCapId.EXP, 4)
-                dev_ctrl_sta = await self.capability_read_dword(cur_func, PcieCapId.EXP, 8)
-
-                max_payload = min(0x5, min(self.max_payload_size, dev_cap & 7))
-                ext_tag = bool(self.extended_tag_field_enable and (dev_cap & (1 << 5)))
-                max_read_req = min(0x5, self.max_read_request_size)
-
-                new_dev_ctrl = (dev_ctrl_sta & 0x00008e1f) | (max_payload << 5) | (ext_tag << 8) | (max_read_req << 12)
-
-                await self.capability_write_dword(cur_func, PcieCapId.EXP, 8, new_dev_ctrl)
-
-                # configure command register
-                val = await self.config_read_word(cur_func, 0x04)
-
-                # enable IO and memory space
-                val |= (1 << 0) | (1 << 1)
-
-                if enable_bus_mastering:
-                    # enable bus mastering
-                    val |= 1 << 2
-
-                await self.config_write_word(cur_func, 0x04, val | 4)
-
-                if configure_msi:
-                    # configure MSI
-                    try:
-                        await self.configure_msi(cur_func)
-                    except Exception:
-                        pass
-
-                if bridge:
-                    # set bridge registers for enumeration
-                    self.log.info("Configure bridge registers for enumeration")
-                    self.log.info("Set pri %d, sec %d, sub %d", bus, sec_bus, 255)
-
-                    ti.pri_bus_num = bus
-                    ti.sec_bus_num = sec_bus
-
-                    await self.config_write(cur_func, 0x018, bytearray([bus, sec_bus, 255]))
-
-                    # enumerate secondary bus
-                    self.log.info("Enumerate secondary bus")
-                    sub_bus = await self.enumerate_segment(tree=ti, bus=sec_bus, timeout=timeout,
-                        enable_bus_mastering=enable_bus_mastering, configure_msi=configure_msi)
-
-                    # finalize bridge configuration
-                    self.log.info("Finalize bridge configuration")
-                    self.log.info("Set pri %d, sec %d, sub %d", bus, sec_bus, sub_bus)
-
-                    ti.pri_bus_num = bus
-                    ti.sec_bus_num = sec_bus
-                    ti.sub_bus_num = sub_bus
-
-                    await self.config_write(cur_func, 0x018, bytearray([bus, sec_bus, sub_bus]))
-
-                    # set base/limit registers
-                    self.log.info("Set IO base: 0x%08x, limit: 0x%08x", ti.io_base, ti.io_limit)
-
-                    await self.config_write(cur_func, 0x01C, struct.pack('BB',
-                        (ti.io_base >> 8) & 0xf0, (ti.io_limit >> 8) & 0xf0))
-                    await self.config_write(cur_func, 0x030, struct.pack('<HH', ti.io_base >> 16, ti.io_limit >> 16))
-
-                    self.log.info("Set mem base: 0x%08x, limit: 0x%08x", ti.mem_base, ti.mem_limit)
-
-                    await self.config_write(cur_func, 0x020, struct.pack('<HH',
-                        (ti.mem_base >> 16) & 0xfff0, (ti.mem_limit >> 16) & 0xfff0))
-
-                    self.log.info("Set prefetchable mem base: 0x%016x, limit: 0x%016x",
-                        ti.prefetchable_mem_base, ti.prefetchable_mem_limit)
-
-                    await self.config_write(cur_func, 0x024, struct.pack('<HH',
-                        (ti.prefetchable_mem_base >> 16) & 0xfff0, (ti.prefetchable_mem_limit >> 16) & 0xfff0))
-                    await self.config_write(cur_func, 0x028, struct.pack('<L', ti.prefetchable_mem_base >> 32))
-                    await self.config_write(cur_func, 0x02c, struct.pack('<L', ti.prefetchable_mem_limit >> 32))
-
-                    sec_bus = sub_bus+1
-
-                if header_type & 0x80 == 0:
-                    # only one function
-                    break
-
-        tree.sub_bus_num = sub_bus
-
-        # align limits against bridge registers
-        self.io_limit = align(self.io_limit, 0xfff)
-        self.mem_limit = align(self.mem_limit, 0xfffff)
-        self.prefetchable_mem_limit = align(self.prefetchable_mem_limit, 0xfffff)
-
-        tree.io_limit = self.io_limit-1
-        tree.mem_limit = self.mem_limit-1
-        tree.prefetchable_mem_limit = self.prefetchable_mem_limit-1
-
-        self.log.info("Enumeration of bus %d complete", bus)
-
-        return sub_bus
-
-    async def enumerate(self, timeout=1000, timeout_unit='ns', enable_bus_mastering=False, configure_msi=False):
+    async def enumerate(self, timeout=1000, timeout_unit='ns'):
         self.log.info("Enumerating bus")
 
-        self.io_limit = self.io_base
-        self.mem_limit = self.mem_base
-        self.prefetchable_mem_limit = self.prefetchable_mem_base
+        self.host_bridge.max_payload_size = self.max_payload_size
+        self.host_bridge.max_payload_size_supported = self.max_payload_size_supported
+        self.host_bridge.max_read_request_size = self.max_read_request_size
 
-        self.tree = TreeItem()
-        await self.enumerate_segment(tree=self.tree, bus=0, timeout=timeout, timeout_unit=timeout_unit,
-            enable_bus_mastering=enable_bus_mastering, configure_msi=configure_msi)
+        self.host_bridge.io_base = self.io_base
+        self.host_bridge.io_limit = self.io_base
+        self.host_bridge.mem_base = self.mem_base
+        self.host_bridge.mem_limit = self.mem_base
+        self.host_bridge.prefetchable_mem_base = self.prefetchable_mem_base
+        self.host_bridge.prefetchable_mem_limit = self.prefetchable_mem_base
+
+        await self.host_bridge.probe(timeout=timeout, timeout_unit=timeout_unit)
+
+        self.io_base = self.host_bridge.io_base
+        self.io_limit = self.host_bridge.io_limit
+        self.mem_base = self.host_bridge.mem_base
+        self.mem_limit = self.host_bridge.mem_limit
+        self.prefetchable_mem_base = self.host_bridge.prefetchable_mem_base
+        self.prefetchable_mem_limit = self.host_bridge.prefetchable_mem_limit
 
         self.upstream_bridge.io_base = self.io_base
         self.upstream_bridge.io_limit = self.io_limit
@@ -1427,4 +895,4 @@ class RootComplex(Switch):
         self.upstream_bridge.prefetchable_mem_limit = self.prefetchable_mem_limit
 
         self.log.info("Enumeration complete")
-        self.log.info("Device tree: \n%s", self.tree.to_str().strip())
+        self.log.info("Device tree: \n%s", self.host_bridge.to_str().strip())

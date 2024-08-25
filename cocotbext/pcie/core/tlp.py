@@ -105,8 +105,10 @@ class MsgType(enum.IntEnum):
     DEASSERT_INTD  = 0x27
     ERR_COR        = 0x30
     ERR_NONFATAL   = 0x31
-    ERR_FATAL      = 0x32
+    ERR_FATAL      = 0x33
     SET_SPL        = 0x50
+    PTM_REQ        = 0x52
+    PTM_RESP       = 0x53
     VENDOR_0       = 0x7e
     VENDOR_1       = 0x7f
 
@@ -200,18 +202,17 @@ class Tlp:
         self.bcm = False
         self.byte_count = 0
         self.requester_id = PcieId(0, 0, 0)
-        self.dest_id = PcieId(0, 0, 0)
         self.tag = 0
         self.first_be = 0
         self.last_be = 0
         self.lower_address = 0
         self.address = 0
         self.ph = 0
-        self.register_number = 0
         self.data = bytearray()
         self.seq = 0
 
         self.release_fc_cb = None
+        self.ingress_port = None
 
         if isinstance(tlp, Tlp):
             self.fmt = tlp.fmt
@@ -228,14 +229,12 @@ class Tlp:
             self.bcm = tlp.bcm
             self.byte_count = tlp.byte_count
             self.requester_id = tlp.requester_id
-            self.dest_id = tlp.dest_id
             self.tag = tlp.tag
             self.first_be = tlp.first_be
             self.last_be = tlp.last_be
             self.lower_address = tlp.lower_address
             self.address = tlp.address
             self.ph = tlp.ph
-            self.register_number = tlp.register_number
             self.data = bytearray(tlp.data)
             self.seq = tlp.seq
 
@@ -266,40 +265,37 @@ class Tlp:
     def requester_id(self, val):
         self._requester_id = PcieId(val)
 
-    @property
-    def dest_id(self):
-        return self._dest_id
-
-    @dest_id.setter
-    def dest_id(self, val):
-        self._dest_id = PcieId(val)
-
     def check(self):
         """Validate TLP"""
         ret = True
         if self.fmt == TlpFmt.THREE_DW_DATA or self.fmt == TlpFmt.FOUR_DW_DATA:
             if self.length*4 != len(self.data):
-                print("TLP validation failed, length field does not match data: %s" % repr(self))
+                print(f"TLP validation failed, length field does not match data: {self!r}")
                 ret = False
             if 0 > self.length > 1024:
-                print("TLP validation failed, length out of range: %s" % repr(self))
+                print(f"TLP validation failed, length out of range: {self!r}")
                 ret = False
         if self.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64, TlpType.MEM_READ_LOCKED,
                 TlpType.MEM_READ_LOCKED_64, TlpType.MEM_WRITE, TlpType.MEM_WRITE_64}:
             if self.length*4 > 0x1000 - (self.address & 0xfff):
-                print("TLP validation failed, request crosses 4K boundary: %s" % repr(self))
+                print(f"TLP validation failed, request crosses 4K boundary: {self!r}")
                 ret = False
         if self.fmt_type == {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0, TlpType.CFG_READ_1,
                 TlpType.CFG_WRITE_1, TlpType.IO_READ, TlpType.IO_WRITE}:
             if self.length != 1:
-                print("TLP validation failed, invalid length for IO or configuration request: %s" % repr(self))
+                print(f"TLP validation failed, invalid length for IO or configuration request: {self!r}")
                 ret = False
             if self.last_be != 0:
-                print("TLP validation failed, invalid last BE for IO or configuration request: %s" % repr(self))
+                print(f"TLP validation failed, invalid last BE for IO or configuration request: {self!r}")
                 ret = False
         if self.fmt_type in {TlpType.CPL_DATA, TlpType.CPL_LOCKED_DATA}:
             if (self.byte_count + (self.lower_address & 3) + 3) < self.length*4:
-                print("TLP validation failed, completion byte count too small: %s" % repr(self))
+                print(f"TLP validation failed, completion byte count too small: {self!r}")
+                ret = False
+        if self.fmt_type in {TlpType.CPL, TlpType.CPL_LOCKED, TlpType.MSG_TO_RC, TlpType.MSG_ADDR,
+                TlpType.MSG_ID, TlpType.MSG_BCAST, TlpType.MSG_LOCAL, TlpType.MSG_GATHER}:
+            if self.length != 0:
+                print(f"TLP validation failed, length field is reserved: {self!r}")
                 ret = False
         return ret
 
@@ -498,8 +494,8 @@ class Tlp:
             pkt.extend(struct.pack('>L', dw))
 
             if self.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0, TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
-                dw = (self.register_number & 0x3ff) << 2
-                dw |= int(self.dest_id) << 16
+                dw = self.address & 0xffc
+                dw |= int(self.completer_id) << 16
                 pkt.extend(struct.pack('>L', dw))
             else:
                 if self.fmt in {TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA}:
@@ -570,8 +566,8 @@ class Tlp:
 
             if tlp.fmt_type in {TlpType.CFG_READ_0,  TlpType.CFG_WRITE_0, TlpType.CFG_READ_1,  TlpType.CFG_WRITE_1}:
                 dw, = struct.unpack_from('>L', pkt, 8)
-                tlp.register_number = (dw >> 2) >> 0x3ff
-                tlp.dest_id = PcieId.from_int(dw >> 16)
+                tlp.address = dw & 0xffc
+                tlp.completer_id = PcieId.from_int(dw >> 16)
             elif tlp.fmt in {TlpFmt.FOUR_DW, TlpFmt.FOUR_DW_DATA}:
                 val, = struct.unpack_from('>Q', pkt, 8)
                 tlp.address = val & 0xfffffffffffffffc
@@ -625,14 +621,12 @@ class Tlp:
                 self.bcm == other.bcm and
                 self.byte_count == other.byte_count and
                 self.requester_id == other.requester_id and
-                self.dest_id == other.dest_id and
                 self.tag == other.tag and
                 self.first_be == other.first_be and
                 self.last_be == other.last_be and
                 self.lower_address == other.lower_address and
                 self.address == other.address and
                 self.ph == other.ph and
-                self.register_number == other.register_number and
                 self.seq == other.seq
             )
         return False
@@ -649,19 +643,17 @@ class Tlp:
             f"attr={self.attr!s}, "
             f"at={self.at!s}, "
             f"length={self.length}, "
-            f"completer_id={repr(self.completer_id)}, "
+            f"completer_id={self.completer_id!r}, "
             f"status={self.status!s}, "
             f"bcm={self.bcm}, "
             f"byte_count={self.byte_count}, "
-            f"requester_id={repr(self.requester_id)}, "
-            f"dest_id={repr(self.dest_id)}, "
+            f"requester_id={self.requester_id!r}, "
             f"tag={self.tag}, "
             f"first_be={self.first_be:#x}, "
             f"last_be={self.last_be:#x}, "
             f"lower_address={self.lower_address:#x}, "
             f"address={self.address:#x}, "
             f"ph={self.ph}, "
-            f"register_number={self.register_number:#x}, "
             f"seq={self.seq})"
         )
 

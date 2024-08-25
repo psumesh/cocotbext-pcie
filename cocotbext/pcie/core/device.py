@@ -90,7 +90,7 @@ class Device:
         self.functions.sort(key=lambda x: x.function_num)
         if len(self.functions) > 1:
             for f in self.functions:
-                f.multifunction_devlce = True
+                f.multifunction_device = True
         return function
 
     def append_function(self, function):
@@ -110,13 +110,13 @@ class Device:
         self.upstream_port.connect(port)
 
     async def upstream_recv(self, tlp):
-        self.log.debug("Got downstream TLP: %s", repr(tlp))
+        self.log.debug("Got downstream TLP: %r", tlp)
         assert tlp.check()
         if tlp.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0}:
             # config type 0
 
             # capture address information
-            self.bus_num = tlp.dest_id.bus
+            self.bus_num = tlp.completer_id.bus
 
         # pass TLP to function
         for f in self.functions:
@@ -128,34 +128,34 @@ class Device:
 
         if tlp.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0}:
             # Config type 0
-            self.log.warning("Function not found: failed to route config type 0 TLP")
+            self.log.warning("Function not found: failed to route config type 0 TLP: %r", tlp)
         elif tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
             # Config type 1
-            self.log.warning("Malformed TLP: endpoint received config type 1 TLP")
+            self.log.warning("Malformed TLP: endpoint received config type 1 TLP: %r", tlp)
         elif tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
             # Completion
-            self.log.warning("Unexpected completion: failed to route completion to function")
+            self.log.warning("Unexpected completion: failed to route completion to function: %r", tlp)
             return  # no UR response for completion
         elif tlp.fmt_type in {TlpType.IO_READ, TlpType.IO_WRITE}:
             # IO read/write
-            self.log.warning("No BAR match: IO request did not match any BARs")
+            self.log.warning("No BAR match: IO request did not match any BARs: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
             # Memory read/write
-            self.log.warning("No BAR match: memory read request did not match any BARs")
+            self.log.warning("No BAR match: memory read request did not match any BARs: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_WRITE, TlpType.MEM_WRITE_64}:
             # Memory read/write
-            self.log.warning("No BAR match: memory write request did not match any BARs")
+            self.log.warning("No BAR match: memory write request did not match any BARs: %r", tlp)
             return  # no UR response for write request
         else:
             raise Exception("TODO")
 
         # Unsupported request
         cpl = Tlp.create_ur_completion_for_tlp(tlp, PcieId(self.bus_num, 0, 0))
-        self.log.debug("UR Completion: %s", repr(cpl))
+        self.log.debug("UR Completion: %r", cpl)
         await self.upstream_send(cpl)
 
     async def upstream_send(self, tlp):
-        self.log.debug("Sending upstream TLP: %s", repr(tlp))
+        self.log.debug("Sending upstream TLP: %r", tlp)
         assert tlp.check()
         await self.upstream_port.send(tlp)
 

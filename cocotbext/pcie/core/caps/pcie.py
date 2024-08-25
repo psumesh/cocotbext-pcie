@@ -22,16 +22,16 @@ THE SOFTWARE.
 
 """
 
-from .common import PcieCapId, PcieCap
-from .common import PcieExtCapId, PcieExtCap
+from .common import PciCapId, PciCap
+from .common import PciExtCapId, PciExtCap
 from ..utils import byte_mask_update
 
 
-class PcieCapability(PcieCap):
+class PcieCapability(PciCap):
     """PCI Express capability"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cap_id = PcieCapId.EXP
+        self.cap_id = PciCapId.EXP
         self.length = 15
 
         # PCIe capability registers
@@ -489,7 +489,8 @@ class PcieCapability(PcieCap):
             # Link control
             if mask & 0x1:
                 self.aspm_control = data & 3
-                self.read_completion_boundary = bool(data & 1 << 4)
+                self.read_completion_boundary = bool(data & 1 << 3)
+                self.link_disable = bool(data & 1 << 4)
                 if data & 1 << 5:
                     await self.initiate_retrain_link()
                 self.common_clock_configuration = bool(data & 1 << 6)
@@ -591,11 +592,11 @@ class PcieCapability(PcieCap):
         pass
 
 
-class PcieExtendedCapability(PcieExtCap):
+class PcieExtendedCapability(PciExtCap):
     """Secondary PCI Express extended capability"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cap_id = PcieExtCapId.EXP2
+        self.cap_id = PciExtCapId.EXP2
         self.cap_ver = 1
         self.length = 4
 

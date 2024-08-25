@@ -24,7 +24,9 @@ THE SOFTWARE.
 
 // Language: Verilog 2001
 
+`resetall
 `timescale 1ns / 1ns
+`default_nettype none
 
 /*
  * Xilinx UltraScale PCIe IP core model test module
@@ -36,7 +38,8 @@ module test_pcie_us #
     parameter RQ_USER_WIDTH = 60,
     parameter RC_USER_WIDTH = 75,
     parameter CQ_USER_WIDTH = 85,
-    parameter CC_USER_WIDTH = 33
+    parameter CC_USER_WIDTH = 33,
+    parameter RC_STRADDLE = 0
 )
 (
     output                      user_clk,
@@ -152,6 +155,15 @@ module test_pcie_us #
     input  [3:0]                cfg_interrupt_msi_pending_status_function_num,
     output                      cfg_interrupt_msi_sent,
     output                      cfg_interrupt_msi_fail,
+    output [1:0]                cfg_interrupt_msix_enable,
+    output [1:0]                cfg_interrupt_msix_mask,
+    output [7:0]                cfg_interrupt_msix_vf_enable,
+    output [7:0]                cfg_interrupt_msix_vf_mask,
+    input  [63:0]               cfg_interrupt_msix_address,
+    input  [31:0]               cfg_interrupt_msix_data,
+    input                       cfg_interrupt_msix_int,
+    output                      cfg_interrupt_msix_sent,
+    output                      cfg_interrupt_msix_fail,
     input  [2:0]                cfg_interrupt_msi_attr,
     input                       cfg_interrupt_msi_tph_present,
     input  [1:0]                cfg_interrupt_msi_tph_type,
@@ -179,3 +191,5 @@ module test_pcie_us #
 );
 
 endmodule
+
+`resetall

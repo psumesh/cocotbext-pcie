@@ -1,6 +1,6 @@
 """
 
-Copyright (c) 2021 Alex Forencich
+Copyright (c) 2022 Alex Forencich
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,10 +22,5 @@ THE SOFTWARE.
 
 """
 
-from .common import PciCapId, PciExtCapId
-from .common import PciCap, PciExtCap, PciCapList, PciExtCapList
-
-from .pcie import PcieCapability, PcieExtendedCapability
-from .msi import MsiCapability, MsixCapability
-from .pm import PmCapability
-from .aer import AerExtendedCapability
+from .ptile_model import PTilePcieDevice, PTilePcieFunction
+from .interface import PTileRxBus, PTileTxBus

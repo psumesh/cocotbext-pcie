@@ -83,6 +83,22 @@ class Switch:
         self.min_dev = 1
         self.endpoints = []
 
+    @property
+    def pcie_id(self):
+        return self.upstream_bridge._pcie_id
+
+    @property
+    def bus_num(self):
+        return self.pcie_id.bus
+
+    @property
+    def device_num(self):
+        return self.pcie_id.device
+
+    @property
+    def function_num(self):
+        return self.pcie_id.function
+
     def next_free_device_number(self):
         self.endpoints.sort(key=lambda x: (x.device_num, x.function_num))
         d = self.min_dev
@@ -109,6 +125,11 @@ class Switch:
     def make_port(self, bridge=None, port=None):
         if bridge is None:
             bridge = self.default_downstream_bridge()
+
+            # transfer configuration from upstream bridge
+            bridge.pcie_cap.max_payload_size_supported = self.upstream_bridge.pcie_cap.max_payload_size_supported
+            bridge.pcie_cap.extended_tag_supported = self.upstream_bridge.pcie_cap.extended_tag_supported
+
         if port is not None:
             bridge.set_downstream_port(port)
         bridge.pri_bus_num = 0
@@ -126,8 +147,8 @@ class Switch:
 
     def add_switch_port(self, port):
         self.switch_ports.append(port)
-        cocotb.fork(self._run_routing(port))
-        cocotb.fork(self._run_arbitration(port))
+        cocotb.start_soon(self._run_routing(port))
+        cocotb.start_soon(self._run_arbitration(port))
 
         for k in range(len(self.switch_ports)-1):
             tx_queue = Queue()
@@ -143,6 +164,8 @@ class Switch:
     async def _run_routing(self, port):
         while True:
             tlp = await port.ingress_queue.get()
+
+            tlp.ingress_port = port.bridge
 
             ok = False
 
@@ -175,36 +198,36 @@ class Switch:
 
             if tlp.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0}:
                 # Config type 0
-                self.log.warning("Failed to route config type 0 TLP")
+                self.log.warning("Failed to route config type 0 TLP: %r", tlp)
             elif tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
                 # Config type 1
-                self.log.warning("Failed to route config type 1 TLP")
+                self.log.warning("Failed to route config type 1 TLP: %r", tlp)
             elif tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
                 # Completion
-                self.log.warning("Unexpected completion: failed to route completion")
+                self.log.warning("Unexpected completion: failed to route completion: %r", tlp)
                 continue  # no UR response for completion
             elif tlp.fmt_type in {TlpType.IO_READ, TlpType.IO_WRITE}:
                 # IO read/write
-                self.log.warning("No address match: IO request could not be routed")
+                self.log.warning("No address match: IO request could not be routed: %r", tlp)
             elif tlp.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
                 # Memory read/write
-                self.log.warning("No address match: memory read request could not be routed")
+                self.log.warning("No address match: memory read request could not be routed: %r", tlp)
             elif tlp.fmt_type in {TlpType.MEM_WRITE, TlpType.MEM_WRITE_64}:
                 # Memory read/write
-                self.log.warning("No address match: memory write request could not be routed")
+                self.log.warning("No address match: memory write request could not be routed: %r", tlp)
                 continue  # no UR response for write request
             else:
                 raise Exception("TODO")
 
             # Unsupported request
             cpl = Tlp.create_ur_completion_for_tlp(tlp, port.bridge.pcie_id)
-            self.log.debug("UR Completion: %s", repr(cpl))
+            self.log.debug("UR Completion: %r", cpl)
             await port.tx_handler(cpl)
 
     async def _run_arbitration(self, port):
         while True:
-            port.rx_event.clear()
             await port.rx_event.wait()
+            port.rx_event.clear()
 
             while True:
                 ok = False

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 
-Copyright (c) 2020 Alex Forencich
+Copyright (c) 2021 Alex Forencich
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -36,12 +36,10 @@ from cocotb.queue import Queue
 from cocotb.triggers import RisingEdge, FallingEdge, Timer, Event, First
 from cocotb.regression import TestFactory
 
-from cocotbext.axi import AxiStreamBus
 from cocotbext.pcie.core import RootComplex
-from cocotbext.pcie.xilinx.us import UltraScalePlusPcieDevice
-from cocotbext.pcie.xilinx.us.interface import RqSource, RcSink, CqSink, CcSource
-from cocotbext.pcie.xilinx.us.tlp import Tlp_us
-from cocotbext.pcie.core.tlp import TlpType, CplStatus
+from cocotbext.pcie.intel.s10 import S10PcieDevice, S10RxBus, S10TxBus
+from cocotbext.pcie.intel.s10.interface import S10PcieFrame, S10PcieSource, S10PcieSink
+from cocotbext.pcie.core.tlp import Tlp, TlpType, CplStatus
 from cocotbext.pcie.core.utils import PcieId
 
 
@@ -55,42 +53,15 @@ class TB:
         # PCIe
         self.rc = RootComplex()
 
-        cq_straddle = False
-        cc_straddle = False
-        rq_straddle = False
-        rc_straddle = False
-        rc_4tlp_straddle = False
-        if int(os.getenv("STRADDLE", "0")):
-            if len(dut.s_axis_rq_tdata) == 256:
-                rc_straddle = True
-            if len(dut.s_axis_rq_tdata) == 512:
-                cq_straddle = True
-                cc_straddle = True
-                rq_straddle = True
-                rc_straddle = True
-                rc_4tlp_straddle = True
-
-        self.client_tag = bool(int(os.getenv("CLIENT_TAG", "1")))
-
-        self.dev = UltraScalePlusPcieDevice(
+        self.dev = S10PcieDevice(
             # configuration options
             pcie_generation=3,
             # pcie_link_width=2,
-            # user_clk_frequency=250e6,
-            alignment="dword",
-            cq_straddle=cq_straddle,
-            cc_straddle=cc_straddle,
-            rq_straddle=rq_straddle,
-            rc_straddle=rc_straddle,
-            rc_4tlp_straddle=rc_4tlp_straddle,
+            # pld_clk_frequency=250e6,
+            l_tile=False,
             pf_count=1,
             max_payload_size=128,
-            enable_client_tag=self.client_tag,
             enable_extended_tag=False,
-            enable_parity=False,
-            enable_rx_msg_interface=False,
-            enable_sriov=False,
-            enable_extended_configuration=False,
 
             pf0_msi_enable=True,
             pf0_msi_count=32,
@@ -126,199 +97,140 @@ class TB:
             pf3_msix_pba_offset=0x00000000,
 
             # signals
-            user_clk=dut.user_clk,
-            user_reset=dut.user_reset,
-            user_lnk_up=dut.user_lnk_up,
-            sys_clk=dut.sys_clk,
-            sys_clk_gt=dut.sys_clk_gt,
-            sys_reset=dut.sys_reset,
-            phy_rdy_out=dut.phy_rdy_out,
+            # Clock and reset
+            npor=dut.npor,
+            pin_perst=dut.pin_perst,
+            ninit_done=dut.ninit_done,
+            pld_clk_inuse=dut.pld_clk_inuse,
+            pld_core_ready=dut.pld_core_ready,
+            reset_status=dut.reset_status,
+            clr_st=dut.clr_st,
+            refclk=dut.refclk,
+            coreclkout_hip=dut.coreclkout_hip,
 
-            rq_bus=AxiStreamBus.from_prefix(dut, "s_axis_rq"),
-            pcie_rq_seq_num0=dut.pcie_rq_seq_num0,
-            pcie_rq_seq_num_vld0=dut.pcie_rq_seq_num_vld0,
-            pcie_rq_seq_num1=dut.pcie_rq_seq_num1,
-            pcie_rq_seq_num_vld1=dut.pcie_rq_seq_num_vld1,
-            pcie_rq_tag0=dut.pcie_rq_tag0,
-            pcie_rq_tag1=dut.pcie_rq_tag1,
-            pcie_rq_tag_av=dut.pcie_rq_tag_av,
-            pcie_rq_tag_vld0=dut.pcie_rq_tag_vld0,
-            pcie_rq_tag_vld1=dut.pcie_rq_tag_vld1,
+            # RX interface
+            rx_bus=S10RxBus.from_prefix(dut, "rx_st"),
 
-            rc_bus=AxiStreamBus.from_prefix(dut, "m_axis_rc"),
+            # TX interface
+            tx_bus=S10TxBus.from_prefix(dut, "tx_st"),
 
-            cq_bus=AxiStreamBus.from_prefix(dut, "m_axis_cq"),
-            pcie_cq_np_req=dut.pcie_cq_np_req,
-            pcie_cq_np_req_count=dut.pcie_cq_np_req_count,
+            # TX flow control
+            tx_ph_cdts=dut.tx_ph_cdts,
+            tx_pd_cdts=dut.tx_pd_cdts,
+            tx_nph_cdts=dut.tx_nph_cdts,
+            tx_npd_cdts=dut.tx_npd_cdts,
+            tx_cplh_cdts=dut.tx_cplh_cdts,
+            tx_cpld_cdts=dut.tx_cpld_cdts,
+            tx_hdr_cdts_consumed=dut.tx_hdr_cdts_consumed,
+            tx_data_cdts_consumed=dut.tx_data_cdts_consumed,
+            tx_cdts_type=dut.tx_cdts_type,
+            tx_cdts_data_value=dut.tx_cdts_data_value,
 
-            cc_bus=AxiStreamBus.from_prefix(dut, "s_axis_cc"),
+            # Hard IP status
+            int_status=dut.int_status,
+            int_status_common=dut.int_status_common,
+            derr_cor_ext_rpl=dut.derr_cor_ext_rpl,
+            derr_rpl=dut.derr_rpl,
+            derr_cor_ext_rcv=dut.derr_cor_ext_rcv,
+            derr_uncor_ext_rcv=dut.derr_uncor_ext_rcv,
+            rx_par_err=dut.rx_par_err,
+            tx_par_err=dut.tx_par_err,
+            ltssmstate=dut.ltssmstate,
+            link_up=dut.link_up,
+            lane_act=dut.lane_act,
+            currentspeed=dut.currentspeed,
 
-            pcie_tfc_nph_av=dut.pcie_tfc_nph_av,
-            pcie_tfc_npd_av=dut.pcie_tfc_npd_av,
-            cfg_phy_link_down=dut.cfg_phy_link_down,
-            cfg_phy_link_status=dut.cfg_phy_link_status,
-            cfg_negotiated_width=dut.cfg_negotiated_width,
-            cfg_current_speed=dut.cfg_current_speed,
-            cfg_max_payload=dut.cfg_max_payload,
-            cfg_max_read_req=dut.cfg_max_read_req,
-            cfg_function_status=dut.cfg_function_status,
-            cfg_function_power_state=dut.cfg_function_power_state,
-            cfg_vf_status=dut.cfg_vf_status,
-            cfg_vf_power_state=dut.cfg_vf_power_state,
-            cfg_link_power_state=dut.cfg_link_power_state,
-            cfg_mgmt_addr=dut.cfg_mgmt_addr,
-            cfg_mgmt_function_number=dut.cfg_mgmt_function_number,
-            cfg_mgmt_write=dut.cfg_mgmt_write,
-            cfg_mgmt_write_data=dut.cfg_mgmt_write_data,
-            cfg_mgmt_byte_enable=dut.cfg_mgmt_byte_enable,
-            cfg_mgmt_read=dut.cfg_mgmt_read,
-            cfg_mgmt_read_data=dut.cfg_mgmt_read_data,
-            cfg_mgmt_read_write_done=dut.cfg_mgmt_read_write_done,
-            cfg_mgmt_debug_access=dut.cfg_mgmt_debug_access,
-            cfg_err_cor_out=dut.cfg_err_cor_out,
-            cfg_err_nonfatal_out=dut.cfg_err_nonfatal_out,
-            cfg_err_fatal_out=dut.cfg_err_fatal_out,
-            cfg_local_error_valid=dut.cfg_local_error_valid,
-            cfg_local_error_out=dut.cfg_local_error_out,
-            cfg_ltssm_state=dut.cfg_ltssm_state,
-            cfg_rx_pm_state=dut.cfg_rx_pm_state,
-            cfg_tx_pm_state=dut.cfg_tx_pm_state,
-            cfg_rcb_status=dut.cfg_rcb_status,
-            cfg_obff_enable=dut.cfg_obff_enable,
-            cfg_pl_status_change=dut.cfg_pl_status_change,
-            cfg_tph_requester_enable=dut.cfg_tph_requester_enable,
-            cfg_tph_st_mode=dut.cfg_tph_st_mode,
-            cfg_vf_tph_requester_enable=dut.cfg_vf_tph_requester_enable,
-            cfg_vf_tph_st_mode=dut.cfg_vf_tph_st_mode,
-            cfg_msg_received=dut.cfg_msg_received,
-            cfg_msg_received_data=dut.cfg_msg_received_data,
-            cfg_msg_received_type=dut.cfg_msg_received_type,
-            cfg_msg_transmit=dut.cfg_msg_transmit,
-            cfg_msg_transmit_type=dut.cfg_msg_transmit_type,
-            cfg_msg_transmit_data=dut.cfg_msg_transmit_data,
-            cfg_msg_transmit_done=dut.cfg_msg_transmit_done,
-            cfg_fc_ph=dut.cfg_fc_ph,
-            cfg_fc_pd=dut.cfg_fc_pd,
-            cfg_fc_nph=dut.cfg_fc_nph,
-            cfg_fc_npd=dut.cfg_fc_npd,
-            cfg_fc_cplh=dut.cfg_fc_cplh,
-            cfg_fc_cpld=dut.cfg_fc_cpld,
-            cfg_fc_sel=dut.cfg_fc_sel,
-            cfg_dsn=dut.cfg_dsn,
-            cfg_bus_number=dut.cfg_bus_number,
-            cfg_power_state_change_ack=dut.cfg_power_state_change_ack,
-            cfg_power_state_change_interrupt=dut.cfg_power_state_change_interrupt,
-            cfg_err_cor_in=dut.cfg_err_cor_in,
-            cfg_err_uncor_in=dut.cfg_err_uncor_in,
-            cfg_flr_in_process=dut.cfg_flr_in_process,
-            cfg_flr_done=dut.cfg_flr_done,
-            cfg_vf_flr_in_process=dut.cfg_vf_flr_in_process,
-            cfg_vf_flr_func_num=dut.cfg_vf_flr_func_num,
-            cfg_vf_flr_done=dut.cfg_vf_flr_done,
-            cfg_link_training_enable=dut.cfg_link_training_enable,
-            cfg_interrupt_int=dut.cfg_interrupt_int,
-            cfg_interrupt_pending=dut.cfg_interrupt_pending,
-            cfg_interrupt_sent=dut.cfg_interrupt_sent,
-            cfg_interrupt_msi_enable=dut.cfg_interrupt_msi_enable,
-            cfg_interrupt_msi_mmenable=dut.cfg_interrupt_msi_mmenable,
-            cfg_interrupt_msi_mask_update=dut.cfg_interrupt_msi_mask_update,
-            cfg_interrupt_msi_data=dut.cfg_interrupt_msi_data,
-            cfg_interrupt_msi_select=dut.cfg_interrupt_msi_select,
-            cfg_interrupt_msi_int=dut.cfg_interrupt_msi_int,
-            cfg_interrupt_msi_pending_status=dut.cfg_interrupt_msi_pending_status,
-            cfg_interrupt_msi_pending_status_data_enable=dut.cfg_interrupt_msi_pending_status_data_enable,
-            cfg_interrupt_msi_pending_status_function_num=dut.cfg_interrupt_msi_pending_status_function_num,
-            cfg_interrupt_msi_sent=dut.cfg_interrupt_msi_sent,
-            cfg_interrupt_msi_fail=dut.cfg_interrupt_msi_fail,
-            cfg_interrupt_msix_enable=dut.cfg_interrupt_msix_enable,
-            cfg_interrupt_msix_mask=dut.cfg_interrupt_msix_mask,
-            cfg_interrupt_msix_vf_enable=dut.cfg_interrupt_msix_vf_enable,
-            cfg_interrupt_msix_vf_mask=dut.cfg_interrupt_msix_vf_mask,
-            cfg_interrupt_msix_address=dut.cfg_interrupt_msix_address,
-            cfg_interrupt_msix_data=dut.cfg_interrupt_msix_data,
-            cfg_interrupt_msix_int=dut.cfg_interrupt_msix_int,
-            cfg_interrupt_msix_vec_pending=dut.cfg_interrupt_msix_vec_pending,
-            cfg_interrupt_msix_vec_pending_status=dut.cfg_interrupt_msix_vec_pending_status,
-            cfg_interrupt_msix_sent=dut.cfg_interrupt_msix_sent,
-            cfg_interrupt_msix_fail=dut.cfg_interrupt_msix_fail,
-            cfg_interrupt_msi_attr=dut.cfg_interrupt_msi_attr,
-            cfg_interrupt_msi_tph_present=dut.cfg_interrupt_msi_tph_present,
-            cfg_interrupt_msi_tph_type=dut.cfg_interrupt_msi_tph_type,
-            cfg_interrupt_msi_tph_st_tag=dut.cfg_interrupt_msi_tph_st_tag,
-            cfg_interrupt_msi_function_number=dut.cfg_interrupt_msi_function_number,
-            cfg_pm_aspm_l1_entry_reject=dut.cfg_pm_aspm_l1_entry_reject,
-            cfg_pm_aspm_tx_l0s_entry_disable=dut.cfg_pm_aspm_tx_l0s_entry_disable,
-            cfg_hot_reset_out=dut.cfg_hot_reset_out,
-            cfg_config_space_enable=dut.cfg_config_space_enable,
-            cfg_req_pm_transition_l23_ready=dut.cfg_req_pm_transition_l23_ready,
-            cfg_hot_reset_in=dut.cfg_hot_reset_in,
-            cfg_ds_port_number=dut.cfg_ds_port_number,
-            cfg_ds_bus_number=dut.cfg_ds_bus_number,
-            cfg_ds_device_number=dut.cfg_ds_device_number,
+            # Power management
+            pm_linkst_in_l1=dut.pm_linkst_in_l1,
+            pm_linkst_in_l0s=dut.pm_linkst_in_l0s,
+            pm_state=dut.pm_state,
+            pm_dstate=dut.pm_dstate,
+            apps_pm_xmt_pme=dut.apps_pm_xmt_pme,
+            apps_ready_entr_l23=dut.apps_ready_entr_l23,
+            apps_pm_xmt_turnoff=dut.apps_pm_xmt_turnoff,
+            app_init_rst=dut.app_init_rst,
+            app_xfer_pending=dut.app_xfer_pending,
+
+            # Interrupt interface
+            app_msi_req=dut.app_msi_req,
+            app_msi_ack=dut.app_msi_ack,
+            app_msi_tc=dut.app_msi_tc,
+            app_msi_num=dut.app_msi_num,
+            app_msi_func_num=dut.app_msi_func_num,
+            app_int_sts=dut.app_int_sts,
+
+            # Error interface
+            app_err_valid=dut.app_err_valid,
+            app_err_hdr=dut.app_err_hdr,
+            app_err_info=dut.app_err_info,
+            app_err_func_num=dut.app_err_func_num,
+
+            # Configuration output
+            tl_cfg_func=dut.tl_cfg_func,
+            tl_cfg_add=dut.tl_cfg_add,
+            tl_cfg_ctl=dut.tl_cfg_ctl,
+
+            # Configuration extension bus
+            ceb_req=dut.ceb_req,
+            ceb_ack=dut.ceb_ack,
+            ceb_addr=dut.ceb_addr,
+            ceb_din=dut.ceb_din,
+            ceb_dout=dut.ceb_dout,
+            ceb_wr=dut.ceb_wr,
+            ceb_cdm_convert_data=dut.ceb_cdm_convert_data,
+            ceb_func_num=dut.ceb_func_num,
+            ceb_vf_num=dut.ceb_vf_num,
+            ceb_vf_active=dut.ceb_vf_active,
+
+            # Hard IP reconfiguration interface
+            hip_reconfig_clk=dut.hip_reconfig_clk,
+            hip_reconfig_address=dut.hip_reconfig_address,
+            hip_reconfig_read=dut.hip_reconfig_read,
+            hip_reconfig_readdata=dut.hip_reconfig_readdata,
+            hip_reconfig_readdatavalid=dut.hip_reconfig_readdatavalid,
+            hip_reconfig_write=dut.hip_reconfig_write,
+            hip_reconfig_writedata=dut.hip_reconfig_writedata,
+            hip_reconfig_waitrequest=dut.hip_reconfig_waitrequest,
         )
 
         self.dev.log.setLevel(logging.DEBUG)
 
-        dut.pcie_cq_np_req.setimmediatevalue(1)
-        dut.cfg_mgmt_addr.setimmediatevalue(0)
-        dut.cfg_mgmt_function_number.setimmediatevalue(0)
-        dut.cfg_mgmt_write.setimmediatevalue(0)
-        dut.cfg_mgmt_write_data.setimmediatevalue(0)
-        dut.cfg_mgmt_byte_enable.setimmediatevalue(0)
-        dut.cfg_mgmt_read.setimmediatevalue(0)
-        dut.cfg_mgmt_debug_access.setimmediatevalue(0)
-        dut.cfg_msg_transmit.setimmediatevalue(0)
-        dut.cfg_msg_transmit_type.setimmediatevalue(0)
-        dut.cfg_msg_transmit_data.setimmediatevalue(0)
-        dut.cfg_fc_sel.setimmediatevalue(0)
-        dut.cfg_dsn.setimmediatevalue(0)
-        dut.cfg_power_state_change_ack.setimmediatevalue(0)
-        dut.cfg_err_cor_in.setimmediatevalue(0)
-        dut.cfg_err_uncor_in.setimmediatevalue(0)
-        dut.cfg_flr_done.setimmediatevalue(0)
-        dut.cfg_vf_flr_func_num.setimmediatevalue(0)
-        dut.cfg_vf_flr_done.setimmediatevalue(0)
-        dut.cfg_link_training_enable.setimmediatevalue(1)
-        dut.cfg_interrupt_int.setimmediatevalue(0)
-        dut.cfg_interrupt_pending.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_select.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_int.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_pending_status.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_pending_status_data_enable.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_pending_status_function_num.setimmediatevalue(0)
-        dut.cfg_interrupt_msix_address.setimmediatevalue(0)
-        dut.cfg_interrupt_msix_data.setimmediatevalue(0)
-        dut.cfg_interrupt_msix_int.setimmediatevalue(0)
-        dut.cfg_interrupt_msix_vec_pending.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_attr.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_tph_present.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_tph_type.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_tph_st_tag.setimmediatevalue(0)
-        dut.cfg_interrupt_msi_function_number.setimmediatevalue(0)
-        dut.cfg_pm_aspm_l1_entry_reject.setimmediatevalue(0)
-        dut.cfg_pm_aspm_tx_l0s_entry_disable.setimmediatevalue(0)
-        dut.cfg_config_space_enable.setimmediatevalue(1)
-        dut.cfg_req_pm_transition_l23_ready.setimmediatevalue(0)
-        dut.cfg_hot_reset_in.setimmediatevalue(0)
-        dut.cfg_ds_port_number.setimmediatevalue(0)
-        dut.cfg_ds_bus_number.setimmediatevalue(0)
-        dut.cfg_ds_device_number.setimmediatevalue(0)
-        dut.sys_clk.setimmediatevalue(0)
-        dut.sys_clk_gt.setimmediatevalue(0)
-        dut.sys_reset.setimmediatevalue(1)
+        dut.npor.setimmediatevalue(1)
+        dut.pin_perst.setimmediatevalue(1)
+        dut.ninit_done.setimmediatevalue(0)
+        dut.pld_core_ready.setimmediatevalue(1)
+        dut.refclk.setimmediatevalue(0)
+        dut.apps_pm_xmt_pme.setimmediatevalue(0)
+        dut.apps_ready_entr_l23.setimmediatevalue(0)
+        dut.apps_pm_xmt_turnoff.setimmediatevalue(0)
+        dut.app_init_rst.setimmediatevalue(0)
+        dut.app_xfer_pending.setimmediatevalue(0)
+        dut.app_msi_req.setimmediatevalue(0)
+        dut.app_msi_tc.setimmediatevalue(0)
+        dut.app_msi_num.setimmediatevalue(0)
+        dut.app_msi_func_num.setimmediatevalue(0)
+        dut.app_int_sts.setimmediatevalue(0)
+        dut.app_err_valid.setimmediatevalue(0)
+        dut.app_err_hdr.setimmediatevalue(0)
+        dut.app_err_info.setimmediatevalue(0)
+        dut.app_err_func_num.setimmediatevalue(0)
+        dut.ceb_ack.setimmediatevalue(0)
+        dut.ceb_din.setimmediatevalue(0)
+        dut.ceb_cdm_convert_data.setimmediatevalue(0)
+        dut.hip_reconfig_clk.setimmediatevalue(0)
+        dut.hip_reconfig_rst_n.setimmediatevalue(1)
+        dut.hip_reconfig_address.setimmediatevalue(0)
+        dut.hip_reconfig_read.setimmediatevalue(0)
+        dut.hip_reconfig_write.setimmediatevalue(0)
+        dut.hip_reconfig_writedata.setimmediatevalue(0)
 
         self.rc.make_port().connect(self.dev)
 
         # user logic
-        cq_segments = 2 if cq_straddle else 1
-        cc_segments = 2 if cc_straddle else 1
-        rq_segments = 2 if rq_straddle else 1
-        rc_segments = 4 if rc_4tlp_straddle else (2 if rc_straddle else 1)
-
-        self.rq_source = RqSource(AxiStreamBus.from_prefix(dut, "s_axis_rq"), dut.user_clk, dut.user_reset, segments=rq_segments)
-        self.rc_sink = RcSink(AxiStreamBus.from_prefix(dut, "m_axis_rc"), dut.user_clk, dut.user_reset, segments=rc_segments)
-        self.cq_sink = CqSink(AxiStreamBus.from_prefix(dut, "m_axis_cq"), dut.user_clk, dut.user_reset, segments=cq_segments)
-        self.cc_source = CcSource(AxiStreamBus.from_prefix(dut, "s_axis_cc"), dut.user_clk, dut.user_reset, segments=cc_segments)
+        self.tx_source = S10PcieSource(S10TxBus.from_prefix(dut, "tx_st"), dut.coreclkout_hip)
+        self.tx_source.ready_latency = 3
+        self.rx_sink = S10PcieSink(S10RxBus.from_prefix(dut, "rx_st"), dut.coreclkout_hip)
+        self.rx_sink.ready_latency = 18 if self.tx_source.width == 512 else 17
 
         self.regions = [None]*6
         self.regions[0] = mmap.mmap(-1, 1024*1024)
@@ -331,30 +243,36 @@ class TB:
         self.tag_active = [False]*256
         self.tag_release = Event()
 
-        self.rq_tag = Queue()
-
         self.rx_cpl_queues = [Queue() for k in range(256)]
         self.rx_cpl_sync = [Event() for k in range(256)]
+
+        self.dev_bus_num = 0
+        self.dev_device_num = 0
+        self.dev_max_payload = 0
+        self.dev_max_read_req = 0
+        self.dev_msi_enable = 0
+        self.dev_msi_multi_msg_enable = 0
+        self.dev_msi_address = 0
+        self.dev_msi_data = 0
+        self.dev_msi_mask = 0
+        self.dev.msix_enable = 0
+        self.dev.msix_function_mask = 0
 
         self.dev.functions[0].configure_bar(0, len(self.regions[0]))
         self.dev.functions[0].configure_bar(1, len(self.regions[1]), True, True)
         self.dev.functions[0].configure_bar(3, len(self.regions[3]), False, False, True)
         self.dev.functions[0].configure_bar(4, len(self.regions[4]))
 
-        if not self.client_tag:
-            cocotb.start_soon(self._run_rq_tags())
-        cocotb.start_soon(self._run_rc())
-        cocotb.start_soon(self._run_cq())
+        cocotb.start_soon(self._run_rx_tlp())
+        cocotb.start_soon(self._run_cfg())
 
     def set_idle_generator(self, generator=None):
         if generator:
-            self.dev.rc_source.set_pause_generator(generator())
-            self.dev.cq_source.set_pause_generator(generator())
+            self.dev.rx_source.set_pause_generator(generator())
 
     def set_backpressure_generator(self, generator=None):
         if generator:
-            self.dev.rq_sink.set_pause_generator(generator())
-            self.dev.cc_sink.set_pause_generator(generator())
+            self.dev.tx_sink.set_pause_generator(generator())
 
     async def recv_cpl(self, tag, timeout=0, timeout_unit='ns'):
         queue = self.rx_cpl_queues[tag]
@@ -395,17 +313,14 @@ class TB:
         self.tag_release.set()
 
     async def perform_posted_operation(self, req):
-        await self.rq_source.send(req.pack_us_rq())
+        await self.tx_source.send(S10PcieFrame.from_tlp(req))
 
     async def perform_nonposted_operation(self, req, timeout=0, timeout_unit='ns'):
         completions = []
 
-        if self.client_tag:
-            req.tag = await self.alloc_tag()
-            await self.rq_source.send(req.pack_us_rq())
-        else:
-            await self.rq_source.send(req.pack_us_rq())
-            req.tag = await self.rq_tag.get()
+        req.tag = await self.alloc_tag()
+
+        await self.tx_source.send(S10PcieFrame.from_tlp(req))
 
         while True:
             cpl = await self.recv_cpl(req.tag, timeout, timeout_unit)
@@ -433,8 +348,7 @@ class TB:
                 # completion for other request
                 break
 
-        if self.client_tag:
-            self.release_tag(req.tag)
+        self.release_tag(req.tag)
 
         return completions
 
@@ -448,9 +362,9 @@ class TB:
         op_list = []
 
         while n < len(data):
-            req = Tlp_us()
+            req = Tlp()
             req.fmt_type = TlpType.IO_WRITE
-            req.requester_id = PcieId(0, 0, 0)
+            req.requester_id = PcieId(self.dev_bus_num, self.dev_device_num, 0)
 
             first_pad = addr % 4
             byte_length = min(len(data)-n, 4-first_pad)
@@ -483,9 +397,9 @@ class TB:
         op_list = []
 
         while n < length:
-            req = Tlp_us()
+            req = Tlp()
             req.fmt_type = TlpType.IO_READ
-            req.requester_id = PcieId(0, 0, 0)
+            req.requester_id = PcieId(self.dev_bus_num, self.dev_device_num, 0)
 
             first_pad = addr % 4
             byte_length = min(length-n, 4-first_pad)
@@ -526,17 +440,17 @@ class TB:
             data = b'\x00'
 
         while n < len(data):
-            req = Tlp_us()
+            req = Tlp()
             if addr > 0xffffffff:
                 req.fmt_type = TlpType.MEM_WRITE_64
             else:
                 req.fmt_type = TlpType.MEM_WRITE
-            req.requester_id = PcieId(0, 0, 0)
+            req.requester_id = PcieId(self.dev_bus_num, self.dev_device_num, 0)
 
             first_pad = addr % 4
             byte_length = len(data)-n
             # max payload size
-            byte_length = min(byte_length, (128 << self.dut.cfg_max_payload.value.integer)-first_pad)
+            byte_length = min(byte_length, (128 << self.dev_max_payload)-first_pad)
             # 4k address align
             byte_length = min(byte_length, 0x1000 - (addr & 0xfff))
             req.set_addr_be_data(addr, data[n:n+byte_length])
@@ -560,20 +474,20 @@ class TB:
         op_list = []
 
         while n < length:
-            req = Tlp_us()
+            req = Tlp()
             if addr > 0xffffffff:
                 req.fmt_type = TlpType.MEM_READ_64
             else:
                 req.fmt_type = TlpType.MEM_READ
-            req.requester_id = PcieId(0, 0, 0)
+            req.requester_id = PcieId(self.dev_bus_num, self.dev_device_num, 0)
 
             first_pad = addr % 4
             # remaining length
             byte_length = length-n
             # limit to max read request size
-            if byte_length > (128 << self.dut.cfg_max_read_req.value.integer) - first_pad:
+            if byte_length > (128 << self.dev_max_read_req) - first_pad:
                 # split on 128-byte read completion boundary
-                byte_length = min(byte_length, (128 << self.dut.cfg_max_read_req.value.integer) - (addr & 0x7f))
+                byte_length = min(byte_length, (128 << self.dev_max_read_req) - (addr & 0x7f))
             # 4k align
             byte_length = min(byte_length, 0x1000 - (addr & 0xfff))
             req.set_addr_be(addr, byte_length)
@@ -615,42 +529,27 @@ class TB:
 
         return bytes(data[:length])
 
-    async def _run_rq_tags(self):
-        clock_edge_event = RisingEdge(self.dut.user_clk)
-
+    async def _run_rx_tlp(self):
         while True:
-            await clock_edge_event
+            frame = await self.rx_sink.recv()
 
-            if self.dut.pcie_rq_tag_vld0.value:
-                self.rq_tag.put_nowait(self.dut.pcie_rq_tag0.value.integer)
-            if self.dut.pcie_rq_tag_vld1.value:
-                self.rq_tag.put_nowait(self.dut.pcie_rq_tag1.value.integer)
+            tlp = frame.to_tlp()
 
-    async def _run_rc(self):
-        while True:
-            pkt = await self.rc_sink.recv()
+            self.log.debug("RX TLP: %s", repr(tlp))
 
-            tlp = Tlp_us.unpack_us_rc(pkt)
+            if tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
+                self.log.info("Completion")
 
-            self.log.debug("RC TLP: %s", repr(tlp))
+                self.rx_cpl_queues[tlp.tag].put_nowait(tlp)
+                self.rx_cpl_sync[tlp.tag].set()
 
-            self.rx_cpl_queues[tlp.tag].put_nowait(tlp)
-            self.rx_cpl_sync[tlp.tag].set()
-
-    async def _run_cq(self):
-        while True:
-            pkt = await self.cq_sink.recv()
-
-            tlp = Tlp_us.unpack_us_cq(pkt)
-
-            self.log.debug("CQ TLP: %s", repr(tlp))
-
-            if tlp.fmt_type == TlpType.IO_READ:
+            elif tlp.fmt_type == TlpType.IO_READ:
                 self.log.info("IO read")
 
-                cpl = Tlp_us.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
+                cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(self.dev_bus_num, 0, 0))
 
-                region = tlp.bar_id
+                # region = tlp.bar_id
+                region = 3
                 addr = tlp.address % len(self.regions[region])
                 offset = 0
                 start_offset = None
@@ -678,14 +577,15 @@ class TB:
                 cpl.length = 1
 
                 self.log.debug("Completion: %s", repr(cpl))
-                await self.cc_source.send(cpl.pack_us_cc())
+                await self.tx_source.send(S10PcieFrame.from_tlp(cpl))
 
             elif tlp.fmt_type == TlpType.IO_WRITE:
                 self.log.info("IO write")
 
-                cpl = Tlp_us.create_completion_for_tlp(tlp, PcieId(0, 0, 0))
+                cpl = Tlp.create_completion_for_tlp(tlp, PcieId(self.dev_bus_num, 0, 0))
 
-                region = tlp.bar_id
+                # region = tlp.bar_id
+                region = 3
                 addr = tlp.address % len(self.regions[region])
                 offset = 0
                 start_offset = None
@@ -709,13 +609,13 @@ class TB:
                     self.regions[region][addr+start_offset:addr+offset] = data[start_offset:offset]
 
                 self.log.debug("Completion: %s", repr(cpl))
-                await self.cc_source.send(cpl.pack_us_cc())
+                await self.tx_source.send(S10PcieFrame.from_tlp(cpl))
 
             elif tlp.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
                 self.log.info("Memory read")
 
                 # perform operation
-                region = tlp.bar_id
+                region = frame.bar_range
                 addr = tlp.address % len(self.regions[region])
                 offset = 0
                 length = tlp.length
@@ -731,14 +631,14 @@ class TB:
                 byte_length = tlp.get_be_byte_count()
 
                 while m < dw_length:
-                    cpl = Tlp_us.create_completion_data_for_tlp(tlp, PcieId(0, 0, 0))
+                    cpl = Tlp.create_completion_data_for_tlp(tlp, PcieId(self.dev_bus_num, 0, 0))
 
                     cpl_dw_length = dw_length - m
                     cpl_byte_length = byte_length - n
                     cpl.byte_count = cpl_byte_length
-                    if cpl_dw_length > 32 << self.dut.cfg_max_payload.value.integer:
+                    if cpl_dw_length > 32 << self.dev_max_payload:
                         # max payload size
-                        cpl_dw_length = 32 << self.dut.cfg_max_payload.value.integer
+                        cpl_dw_length = 32 << self.dev_max_payload
                         # RCB align
                         cpl_dw_length -= (addr & 0x7c) >> 2
 
@@ -747,7 +647,7 @@ class TB:
                     cpl.set_data(data[m*4:(m+cpl_dw_length)*4])
 
                     self.log.debug("Completion: %s", repr(cpl))
-                    await self.cc_source.send(cpl.pack_us_cc())
+                    await self.tx_source.send(S10PcieFrame.from_tlp(cpl))
 
                     m += cpl_dw_length
                     n += cpl_dw_length*4 - (addr & 3)
@@ -757,7 +657,7 @@ class TB:
                 self.log.info("Memory write")
 
                 # perform operation
-                region = tlp.bar_id
+                region = frame.bar_range
                 addr = tlp.address % len(self.regions[region])
                 offset = 0
                 start_offset = None
@@ -803,6 +703,31 @@ class TB:
                 if start_offset is not None and offset != start_offset:
                     self.regions[region][addr+start_offset:addr+offset] = data[start_offset:offset]
 
+    async def _run_cfg(self):
+        while True:
+            await RisingEdge(self.dut.coreclkout_hip)
+
+            if self.dut.tl_cfg_func.value.integer == 0:
+                addr = self.dut.tl_cfg_add.value.integer
+                ctl = self.dut.tl_cfg_ctl.value.integer
+                if addr == 0x00:
+                    self.dev_max_payload = ctl & 0x7
+                    self.dev_max_read_req = (ctl >> 3) & 0x7
+                    self.dev_bus_num = (ctl >> 16) & 0xff
+                    self.dev_device_num = (ctl >> 24) & 0x1f
+                elif addr == 0x03:
+                    self.dev_msi_address = (self.dev_msi_address & ~(0xffffffff << 0)) | ctl << 0
+                elif addr == 0x04:
+                    self.dev_msi_address = (self.dev_msi_address & ~(0xffffffff << 32)) | ctl << 32
+                elif addr == 0x05:
+                    self.dev_msi_mask = ctl
+                elif addr == 0x06:
+                    self.dev_msi_enable = ctl & 1
+                    self.dev_msi_multi_msg_enable = (ctl >> 2) & 0x7
+                    self.dev_msi_data = ctl >> 16
+                    self.dev_msix_enable = (ctl >> 5) & 1
+                    self.dev_msix_function_mask = (ctl >> 6) & 1
+
 
 async def run_test_mem(dut, idle_inserter=None, backpressure_inserter=None):
 
@@ -811,7 +736,7 @@ async def run_test_mem(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    await FallingEdge(dut.user_reset)
+    await FallingEdge(dut.reset_status)
     await Timer(100, 'ns')
 
     await tb.rc.enumerate()
@@ -857,8 +782,8 @@ async def run_test_mem(dut, idle_inserter=None, backpressure_inserter=None):
 
             assert await dev_bar1.read(offset, length, timeout=5000) == test_data
 
-    await RisingEdge(dut.user_clk)
-    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.coreclkout_hip)
+    await RisingEdge(dut.coreclkout_hip)
 
 
 async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
@@ -874,7 +799,7 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    await FallingEdge(dut.user_reset)
+    await FallingEdge(dut.reset_status)
     await Timer(100, 'ns')
 
     await tb.rc.enumerate()
@@ -907,8 +832,8 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
 
             assert await tb.dma_io_read(addr, length, 5000, 'ns') == test_data
 
-    await RisingEdge(dut.user_clk)
-    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.coreclkout_hip)
+    await RisingEdge(dut.coreclkout_hip)
 
 
 async def run_test_msi(dut, idle_inserter=None, backpressure_inserter=None):
@@ -918,7 +843,7 @@ async def run_test_msi(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    await FallingEdge(dut.user_reset)
+    await FallingEdge(dut.reset_status)
     await Timer(100, 'ns')
 
     await tb.rc.enumerate()
@@ -928,25 +853,30 @@ async def run_test_msi(dut, idle_inserter=None, backpressure_inserter=None):
     await dev.set_master()
     await dev.alloc_irq_vectors(32, 32)
 
-    assert dut.cfg_interrupt_msi_enable.value.integer & 1
+    await Timer(100, 'ns')
+    assert tb.dev_msi_enable
 
     for k in range(32):
         tb.log.info("Send MSI %d", k)
 
-        await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msi_int.value = 1 << k
-        await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msi_int.value = 0
+        await RisingEdge(dut.coreclkout_hip)
+        dut.app_msi_req.value = 1
+        dut.app_msi_tc.value = 0
+        dut.app_msi_num.value = k
+        dut.app_msi_func_num.value = 0
 
-        while not tb.dut.cfg_interrupt_msi_sent.value.integer and not tb.dut.cfg_interrupt_msi_fail.value.integer:
-            await RisingEdge(dut.user_clk)
+        while not dut.app_msi_ack.value.integer:
+            await RisingEdge(dut.coreclkout_hip)
+
+        dut.app_msi_req.value = 0
+        await RisingEdge(dut.coreclkout_hip)
 
         event = dev.msi_vectors[k].event
         event.clear()
         await event.wait()
 
-    await RisingEdge(dut.user_clk)
-    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.coreclkout_hip)
+    await RisingEdge(dut.coreclkout_hip)
 
 
 async def run_test_msix(dut, idle_inserter=None, backpressure_inserter=None):
@@ -956,7 +886,7 @@ async def run_test_msix(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    await FallingEdge(dut.user_reset)
+    await FallingEdge(dut.reset_status)
     await Timer(100, 'ns')
 
     await tb.rc.enumerate()
@@ -966,68 +896,23 @@ async def run_test_msix(dut, idle_inserter=None, backpressure_inserter=None):
     await dev.set_master()
     await dev.alloc_irq_vectors(64, 64)
 
+    await Timer(100, 'ns')
+    assert tb.dev_msix_enable
+
     for k in range(64):
         tb.log.info("Send MSI %d", k)
 
         addr = int.from_bytes(tb.regions[4][16*k+0:16*k+8], 'little')
         data = int.from_bytes(tb.regions[4][16*k+8:16*k+12], 'little')
 
-        await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msix_address.value = addr
-        tb.dut.cfg_interrupt_msix_data.value = data
-        tb.dut.cfg_interrupt_msix_int.value = 1
-        await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msix_int.value = 0
-
-        while not tb.dut.cfg_interrupt_msix_sent.value.integer and not tb.dut.cfg_interrupt_msix_fail.value.integer:
-            await RisingEdge(dut.user_clk)
+        await tb.dma_mem_write(addr, data.to_bytes(4, 'little'), 5000, 'ns')
 
         event = dev.msi_vectors[k].event
         event.clear()
         await event.wait()
 
-    await RisingEdge(dut.user_clk)
-    await RisingEdge(dut.user_clk)
-
-
-async def run_test_crs(dut, idle_inserter=None, backpressure_inserter=None):
-
-    tb = TB(dut)
-
-    tb.set_idle_generator(idle_inserter)
-    tb.set_backpressure_generator(backpressure_inserter)
-
-    await FallingEdge(dut.user_reset)
-    await Timer(100, 'ns')
-
-    async def toggle_config_space_enable(dut):
-        dut.cfg_config_space_enable.setimmediatevalue(0)
-        await Timer(100, 'us')
-        dut.cfg_config_space_enable.setimmediatevalue(1)
-
-    cocotb.start_soon(toggle_config_space_enable(dut))
-
-    await tb.rc.enumerate()
-
-    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
-    await dev.enable_device()
-
-    dut.cfg_config_space_enable.setimmediatevalue(0)
-
-    val = await dev.config_read_dword(0x00)
-    tb.log.info("ID register values: 0x%08x", val)
-
-    assert val == 0xffff0001
-
-    dut.cfg_config_space_enable.setimmediatevalue(1)
-
-    val = await dev.config_read_dword(0x00)
-    tb.log.info("ID register values: 0x%08x", val)
-
-    assert val != 0xffff0001 and val != 0xffffffff
-
-    await RisingEdge(dut.user_clk)
-    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.coreclkout_hip)
+    await RisingEdge(dut.coreclkout_hip)
 
 
 def cycle_pause():
@@ -1041,7 +926,6 @@ if cocotb.SIM_NAME:
                 run_test_dma,
                 run_test_msi,
                 run_test_msix,
-                run_test_crs,
             ]:
 
         factory = TestFactory(test)
@@ -1054,11 +938,9 @@ if cocotb.SIM_NAME:
 tests_dir = os.path.dirname(__file__)
 
 
-@pytest.mark.parametrize("client_tag", [True, False])
-@pytest.mark.parametrize(("data_width", "straddle"),
-    [(64, False), (128, False), (256, False), (256, True), (512, False), (512, True)])
-def test_pcie_usp(request, data_width, straddle, client_tag):
-    dut = "test_pcie_usp"
+@pytest.mark.parametrize("data_width", [256, 512])
+def test_pcie_s10(request, data_width):
+    dut = "test_pcie_s10"
     module = os.path.splitext(os.path.basename(__file__))[0]
     toplevel = dut
 
@@ -1068,17 +950,12 @@ def test_pcie_usp(request, data_width, straddle, client_tag):
 
     parameters = {}
 
-    parameters['DATA_WIDTH'] = data_width
-    parameters['KEEP_WIDTH'] = (parameters['DATA_WIDTH'] // 32)
-    parameters['RQ_USER_WIDTH'] = 62 if parameters['DATA_WIDTH'] < 512 else 137
-    parameters['RC_USER_WIDTH'] = 75 if parameters['DATA_WIDTH'] < 512 else 161
-    parameters['CQ_USER_WIDTH'] = 88 if parameters['DATA_WIDTH'] < 512 else 183
-    parameters['CC_USER_WIDTH'] = 33 if parameters['DATA_WIDTH'] < 512 else 81
+    parameters['SEG_COUNT'] = 2 if data_width == 512 else 1
+    parameters['SEG_DATA_WIDTH'] = data_width // parameters['SEG_COUNT']
+    parameters['SEG_PARITY_WIDTH'] = parameters['SEG_DATA_WIDTH'] // 8
+    parameters['SEG_EMPTY_WIDTH'] = ((parameters['SEG_DATA_WIDTH'] // 32) - 1).bit_length()
 
     extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
-
-    extra_env['STRADDLE'] = str(int(straddle))
-    extra_env['CLIENT_TAG'] = str(int(client_tag))
 
     sim_build = os.path.join(tests_dir, "sim_build",
         request.node.name.replace('[', '-').replace(']', ''))

@@ -42,17 +42,44 @@ PCIE_GEN_RATE = {
 }
 
 PCIE_GEN_SYMB_TIME = {
-    1: 10/PCIE_GEN_RATE[1],
-    2: 10/PCIE_GEN_RATE[2],
+    1: 8/PCIE_GEN_RATE[1],
+    2: 8/PCIE_GEN_RATE[2],
     3: 8/PCIE_GEN_RATE[3],
     4: 8/PCIE_GEN_RATE[4],
     5: 8/PCIE_GEN_RATE[5],
 }
 
 
+def get_update_factor(max_payload_size, link_width):
+    if max_payload_size <= 256:
+        if link_width <= 4:
+            return 1.4
+        elif link_width == 8:
+            return 2.5
+        else:
+            return 3.0
+    else:
+        if link_width <= 8:
+            return 1.0
+        else:
+            return 2.0
+
+
+def get_max_update_latency(max_payload_size, link_width, link_speed):
+    uf = get_update_factor(max_payload_size, link_width)
+    if link_speed == 1:
+        delay = 19
+    elif link_speed == 2:
+        delay = 70
+    else:
+        delay = 115
+    return (((max_payload_size+28)*uf) / link_width) + delay
+
+
+
 class FcStateData:
     def __init__(self, init=0, *args, **kwargs):
-        self.__dict__.setdefault('_base_field_size', 12)
+        self.__dict__.setdefault('_base_field_size', 16)
 
         self.tx_field_size = self._base_field_size
         self.tx_field_range = 2**self.tx_field_size
@@ -126,7 +153,7 @@ class FcStateData:
 
 class FcStateHeader(FcStateData):
     def __init__(self, *args, **kwargs):
-        self._base_field_size = 8
+        self._base_field_size = 12
         super().__init__(*args, **kwargs)
 
 
@@ -190,7 +217,7 @@ class FcChannelState:
             return self.cplh.tx_credits_available > 0 and self.cpld.tx_credits_available >= dc
 
     def tx_tlp_has_credit(self, tlp):
-        return self.tx_tlp_has_credit(tlp.get_fc_type(), tlp.get_data_credits())
+        return self.tx_has_credit(tlp.get_fc_type(), tlp.get_data_credits())
 
     def tx_consume_fc(self, credit_type, dc=0):
         if credit_type == FcType.P:
@@ -367,10 +394,10 @@ class Port:
         # RX
         self.next_recv_seq = 0x000
         self.nak_scheduled = False
-        self.ack_nak_latency_timer = 0
+        self.ack_nak_latency_timer_steps = 0
 
         self.max_payload_size = 128
-        self.max_latency_timer = 0
+        self.max_latency_timer_steps = 0
 
         self.send_ack = Event()
 
@@ -395,9 +422,9 @@ class Port:
         # VC0 is always active
         self.fc_state[0].active = True
 
-        cocotb.fork(self._run_transmit())
-        cocotb.fork(self._run_receive())
-        cocotb.fork(self._run_fc_update_idle_timer())
+        cocotb.start_soon(self._run_transmit())
+        cocotb.start_soon(self._run_receive())
+        cocotb.start_soon(self._run_fc_update_idle_timer())
 
     def classify_tlp_vc(self, tlp):
         return 0
@@ -583,10 +610,10 @@ class Port:
 
     def start_ack_latency_timer(self):
         if self._ack_latency_timer_cr is not None:
-            if not self._ack_latency_timer_cr._finished:
+            if not self._ack_latency_timer_cr.done():
                 # already running
                 return
-        self._ack_latency_timer_cr = cocotb.fork(self._run_ack_latency_timer())
+        self._ack_latency_timer_cr = cocotb.start_soon(self._run_ack_latency_timer())
 
     def stop_ack_latency_timer(self):
         if self._ack_latency_timer_cr is not None:
@@ -594,17 +621,16 @@ class Port:
             self._ack_latency_timer_cr = None
 
     async def _run_ack_latency_timer(self):
-        d = int(self.time_scale * self.max_latency_timer)
-        await Timer(max(d, 1), 'step')
+        await Timer(max(self.max_latency_timer_steps, 1), 'step')
         if not self.nak_scheduled:
             self.send_ack.set()
 
     def start_fc_update_timer(self):
         if self._fc_update_timer_cr is not None:
-            if not self._fc_update_timer_cr._finished:
+            if not self._fc_update_timer_cr.done():
                 # already running
                 return
-        self._fc_update_timer_cr = cocotb.fork(self._run_fc_update_timer())
+        self._fc_update_timer_cr = cocotb.start_soon(self._run_fc_update_timer())
 
     def stop_fc_update_timer(self):
         if self._fc_update_timer_cr is not None:
@@ -612,13 +638,12 @@ class Port:
             self._fc_update_timer_cr = None
 
     async def _run_fc_update_timer(self):
-        d = int(self.time_scale * self.max_latency_timer)
-        await Timer(max(d, 1), 'step')
+        await Timer(max(self.max_latency_timer_steps, 1), 'step')
         self.send_fc.set()
 
     async def _run_fc_update_idle_timer(self):
         while True:
-            await Timer(self.fc_idle_timer_steps, 'step')
+            await Timer(max(self.fc_idle_timer_steps, 1), 'step')
             self.send_fc.set()
 
 
@@ -631,6 +656,7 @@ class SimPort(Port):
 
         self.port_delay = 5e-9
 
+        self.symbol_period = 0
         self.link_delay_steps = 0
 
     def connect(self, other):
@@ -648,7 +674,9 @@ class SimPort(Port):
     def _connect_int(self, port):
         if self.other is not None:
             raise Exception("Already connected")
+
         self.other = port
+
         if self.max_link_speed:
             if port.max_link_speed:
                 self.cur_link_speed = min(self.max_link_speed, port.max_link_speed)
@@ -656,6 +684,7 @@ class SimPort(Port):
                 self.cur_link_speed = self.max_link_speed
         else:
             self.cur_link_speed = port.max_link_speed
+
         if self.max_link_width:
             if port.max_link_width:
                 self.cur_link_width = min(self.max_link_width, port.max_link_width)
@@ -663,23 +692,22 @@ class SimPort(Port):
                 self.cur_link_width = self.max_link_width
         else:
             self.cur_link_width = port.max_link_width
+
         if self.cur_link_width is not None and self.cur_link_speed is not None:
-            self.max_latency_timer = (self.max_payload_size / self.cur_link_width) * PCIE_GEN_SYMB_TIME[self.cur_link_speed]
-            self.link_delay_steps = (self.port_delay + port.port_delay) * self.time_scale
+            self.symbol_period = 8 / (PCIE_GEN_RATE[self.cur_link_speed] * self.cur_link_width)
+            self.max_latency_timer_steps = int(get_max_update_latency(self.max_payload_size, self.cur_link_width, self.cur_link_speed) * 8 / PCIE_GEN_RATE[self.cur_link_speed] * self.time_scale)
+            self.link_delay_steps = int((self.port_delay + port.port_delay) * self.time_scale)
         else:
-            self.max_latency_timer = 0
+            self.symbol_period = 0
+            self.max_latency_timer_steps = 0
             self.link_delay_steps = 0
 
     async def handle_tx(self, pkt):
-        if self.cur_link_width and self.cur_link_speed:
-            d = int(pkt.get_wire_size()*8*self.time_scale / (PCIE_GEN_RATE[self.cur_link_speed]*self.cur_link_width))
-        else:
-            d = 1
-        await Timer(max(d, 1), 'step')
-        cocotb.fork(self._transmit(pkt))
+        await Timer(max(int(pkt.get_wire_size() * self.symbol_period * self.time_scale), 1), 'step')
+        cocotb.start_soon(self._transmit(pkt))
 
     async def _transmit(self, pkt):
         if self.other is None:
             raise Exception("Port not connected")
-        await Timer(max(self.link_delay_steps, 1), "step")
+        await Timer(max(self.link_delay_steps, 1), 'step')
         await self.other.ext_recv(pkt)

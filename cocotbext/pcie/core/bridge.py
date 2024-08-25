@@ -161,6 +161,8 @@ class Bridge(Function):
             val = (self.prefetchable_mem_base & 0xfff00000) >> 16
             # Prefetchable memory limit
             val |= self.prefetchable_mem_limit & 0xfff00000
+            # supports 64 bit addresses
+            val |= 0x00010001
             return val
         elif reg == 10:
             # Prefetchable memory base (upper)
@@ -280,13 +282,13 @@ class Bridge(Function):
             return False
         elif tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
             # Config type 1
-            return self.sec_bus_num <= tlp.dest_id.bus <= self.sub_bus_num and tlp.dest_id != PcieId(0, 0, 0)
+            return self.sec_bus_num <= tlp.completer_id.bus <= self.sub_bus_num and tlp.completer_id != PcieId(0, 0, 0)
         elif tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
             # Completion
             return self.sec_bus_num <= tlp.requester_id.bus <= self.sub_bus_num and tlp.requester_id != PcieId(0, 0, 0)
         elif tlp.fmt_type in {TlpType.MSG_ID, TlpType.MSG_DATA_ID}:
             # ID routed message
-            return self.sec_bus_num <= tlp.dest_id.bus <= self.sub_bus_num and tlp.dest_id != PcieId(0, 0, 0)
+            return self.sec_bus_num <= tlp.completer_id.bus <= self.sub_bus_num and tlp.completer_id != PcieId(0, 0, 0)
         elif tlp.fmt_type in {TlpType.IO_READ, TlpType.IO_WRITE}:
             # IO read/write
             return self.io_base <= tlp.address <= self.io_limit
@@ -319,7 +321,7 @@ class Bridge(Function):
         await self.upstream_tx_handler(tlp)
 
     async def upstream_recv(self, tlp):
-        self.log.debug("Routing downstream TLP: %s", repr(tlp))
+        self.log.debug("Routing downstream TLP: %r", tlp)
         assert tlp.check()
         if self.parity_error_response_enable and tlp.ep:
             self.log.warning("Received poisoned TLP on primary interface, reporting master data parity error")
@@ -340,7 +342,7 @@ class Bridge(Function):
         # Route TLPs from primary side to secondary side
         if self.match_tlp_secondary(tlp):
 
-            if tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1} and tlp.dest_id.bus == self.sec_bus_num:
+            if tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1} and tlp.completer_id.bus == self.sec_bus_num:
                 # config type 1 targeted to directly connected device; change to type 0
                 if tlp.fmt_type == TlpType.CFG_READ_1:
                     tlp.fmt_type = TlpType.CFG_READ_0
@@ -354,30 +356,30 @@ class Bridge(Function):
 
         if tlp.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0}:
             # Config type 0
-            self.log.warning("Failed to route config type 0 TLP")
+            self.log.warning("Failed to route config type 0 TLP: %r", tlp)
         elif tlp.fmt_type in {TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
             # Config type 1
-            self.log.warning("Failed to route config type 1 TLP")
+            self.log.warning("Failed to route config type 1 TLP: %r", tlp)
         elif tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
             # Completion
-            self.log.warning("Unexpected completion: failed to route completion")
+            self.log.warning("Unexpected completion: failed to route completion: %r", tlp)
             return  # no UR response for completion
         elif tlp.fmt_type in {TlpType.IO_READ, TlpType.IO_WRITE}:
             # IO read/write
-            self.log.warning("No address match: IO request did not match secondary bus or any BARs")
+            self.log.warning("No address match: IO request did not match secondary bus or any BARs: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
             # Memory read/write
-            self.log.warning("No address match: memory read request did not match secondary bus or any BARs")
+            self.log.warning("No address match: memory read request did not match secondary bus or any BARs: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_WRITE, TlpType.MEM_WRITE_64}:
             # Memory read/write
-            self.log.warning("No address match: memory write request did not match secondary bus or any BARs")
+            self.log.warning("No address match: memory write request did not match secondary bus or any BARs: %r", tlp)
             return  # no UR response for write request
         else:
             raise Exception("TODO")
 
         # Unsupported request
         cpl = Tlp.create_ur_completion_for_tlp(tlp, self.pcie_id)
-        self.log.debug("UR Completion: %s", repr(cpl))
+        self.log.debug("UR Completion: %r", cpl)
         await self.upstream_send(cpl)
 
     async def route_downstream_tlp(self, tlp, from_downstream=False):
@@ -393,7 +395,7 @@ class Bridge(Function):
         await self.downstream_tx_handler(tlp)
 
     async def downstream_recv(self, tlp):
-        self.log.debug("Routing upstream TLP: %s", repr(tlp))
+        self.log.debug("Routing upstream TLP: %r", tlp)
         assert tlp.check()
         if self.bridge_parity_error_response_enable and tlp.ep:
             self.log.warning("Received poisoned TLP on secondary interface, reporting master data parity error")
@@ -422,27 +424,27 @@ class Bridge(Function):
 
         if tlp.fmt_type in {TlpType.CFG_READ_0, TlpType.CFG_WRITE_0, TlpType.CFG_READ_1, TlpType.CFG_WRITE_1}:
             # Config type 1
-            self.log.warning("Malformed TLP: received configuration request on downstream switch port")
+            self.log.warning("Malformed TLP: received configuration request on downstream switch port: %r", tlp)
         elif tlp.fmt_type in {TlpType.CPL, TlpType.CPL_DATA, TlpType.CPL_LOCKED, TlpType.CPL_LOCKED_DATA}:
             # Completion
-            self.log.warning("Unexpected completion: completion did not match primary bus")
+            self.log.warning("Unexpected completion: completion did not match primary bus: %r", tlp)
             return  # no UR response for completion
         elif tlp.fmt_type in {TlpType.IO_READ, TlpType.IO_WRITE}:
             # IO read/write
-            self.log.warning("No address match: IO request did not match primary bus")
+            self.log.warning("No address match: IO request did not match primary bus: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
             # Memory read/write
-            self.log.warning("No address match: memory read request did not match primary bus")
+            self.log.warning("No address match: memory read request did not match primary bus: %r", tlp)
         elif tlp.fmt_type in {TlpType.MEM_WRITE, TlpType.MEM_WRITE_64}:
             # Memory read/write
-            self.log.warning("No address match: memory write request did not match primary bus")
+            self.log.warning("No address match: memory write request did not match primary bus: %r", tlp)
             return  # no UR response for write request
         else:
             raise Exception("TODO")
 
         # Unsupported request
         cpl = Tlp.create_ur_completion_for_tlp(tlp, self.pcie_id)
-        self.log.debug("UR Completion: %s", repr(cpl))
+        self.log.debug("UR Completion: %r", cpl)
         await self.downstream_send(cpl)
 
     async def send(self, tlp):
@@ -530,6 +532,7 @@ class RootPort(SwitchDownstreamPort):
         super().__init__(*args, **kwargs)
 
         self.pcie_cap.pcie_device_type = 0x4
+        self.pcie_cap.crs_software_visibility = True
 
         self.vendor_id = 0x1234
         self.device_id = 0x0002

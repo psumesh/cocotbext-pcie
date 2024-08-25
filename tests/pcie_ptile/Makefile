@@ -1,4 +1,4 @@
-# Copyright (c) 2020 Alex Forencich
+# Copyright (c) 2022 Alex Forencich
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -26,20 +26,20 @@ WAVES ?= 0
 COCOTB_HDL_TIMEUNIT = 1ns
 COCOTB_HDL_TIMEPRECISION = 1ps
 
-DUT      = test_pcie_usp
+DUT      = test_pcie_ptile
 TOPLEVEL = $(DUT)
 MODULE   = $(DUT)
 VERILOG_SOURCES  = $(DUT).v
 
 # module parameters
-export PARAM_DATA_WIDTH := 64
-export PARAM_KEEP_WIDTH := $(shell expr $(PARAM_DATA_WIDTH) / 32 )
-export PARAM_RQ_USER_WIDTH := $(if $(filter-out 512,$(PARAM_DATA_WIDTH)),62,137)
-export PARAM_RC_USER_WIDTH := $(if $(filter-out 512,$(PARAM_DATA_WIDTH)),75,161)
-export PARAM_CQ_USER_WIDTH := $(if $(filter-out 512,$(PARAM_DATA_WIDTH)),88,183)
-export PARAM_CC_USER_WIDTH := $(if $(filter-out 512,$(PARAM_DATA_WIDTH)),33,81)
-export STRADDLE := $(if $(filter-out 256 512,$(PARAM_DATA_WIDTH)),0,1)
-export CLIENT_TAG := 1
+export PARAM_SEG_COUNT := 1
+export PARAM_SEG_DATA_WIDTH := 128
+export PARAM_SEG_HDR_WIDTH := 128
+export PARAM_SEG_PRFX_WIDTH := 32
+export PARAM_SEG_DATA_PAR_WIDTH := $(shell expr $(PARAM_SEG_DATA_WIDTH) / 8 )
+export PARAM_SEG_HDR_PAR_WIDTH := $(shell expr $(PARAM_SEG_HDR_WIDTH) / 8 )
+export PARAM_SEG_PRFX_PAR_WIDTH := $(shell expr $(PARAM_SEG_PRFX_WIDTH) / 8 )
+export PARAM_SEG_EMPTY_WIDTH := $(shell python -c "print((($(PARAM_SEG_DATA_WIDTH)//32)-1).bit_length())" )
 
 ifeq ($(SIM), icarus)
 	PLUSARGS += -fst

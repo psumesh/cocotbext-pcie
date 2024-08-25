@@ -32,7 +32,8 @@ import cocotb_test.simulator
 import pytest
 
 import cocotb
-from cocotb.triggers import RisingEdge, FallingEdge, Timer, Event
+from cocotb.queue import Queue
+from cocotb.triggers import RisingEdge, FallingEdge, Timer, Event, First
 from cocotb.regression import TestFactory
 
 from cocotbext.axi import AxiStreamBus
@@ -45,7 +46,7 @@ from cocotbext.pcie.xilinx.us.tlp import Tlp_us
 
 
 class TB:
-    def __init__(self, dut):
+    def __init__(self, dut, msix=False):
         self.dut = dut
 
         self.log = logging.getLogger("cocotb.tb")
@@ -54,23 +55,45 @@ class TB:
         # PCIe
         self.rc = RootComplex()
 
+        rc_straddle = False
+        if int(os.getenv("STRADDLE", "0")):
+            if len(dut.s_axis_rq_tdata) == 256:
+                rc_straddle = True
+
+        self.client_tag = bool(int(os.getenv("CLIENT_TAG", "1")))
+
         self.dev = UltraScalePcieDevice(
             # configuration options
             # pcie_generation=3,
             # pcie_link_width=2,
             # user_clk_frequency=250e6,
             alignment="dword",
-            straddle=False,
-            enable_pf1=False,
-            enable_client_tag=True,
+            rc_straddle=rc_straddle,
+            pf_count=1,
+            max_payload_size=128,
+            enable_client_tag=self.client_tag,
             enable_extended_tag=False,
             enable_parity=False,
             enable_rx_msg_interface=False,
             enable_sriov=False,
             enable_extended_configuration=False,
 
-            enable_pf0_msi=True,
-            enable_pf1_msi=False,
+            pf0_msi_enable=True,
+            pf0_msi_count=32,
+            pf1_msi_enable=False,
+            pf1_msi_count=1,
+            pf0_msix_enable=msix,
+            pf0_msix_table_size=63,
+            pf0_msix_table_bir=4,
+            pf0_msix_table_offset=0x00000000,
+            pf0_msix_pba_bir=4,
+            pf0_msix_pba_offset=0x00008000,
+            pf1_msix_enable=False,
+            pf1_msix_table_size=0,
+            pf1_msix_table_bir=0,
+            pf1_msix_table_offset=0x00000000,
+            pf1_msix_pba_bir=0,
+            pf1_msix_pba_offset=0x00000000,
 
             # signals
             user_clk=dut.user_clk,
@@ -178,6 +201,15 @@ class TB:
             cfg_interrupt_msi_pending_status_function_num=dut.cfg_interrupt_msi_pending_status_function_num,
             cfg_interrupt_msi_sent=dut.cfg_interrupt_msi_sent,
             cfg_interrupt_msi_fail=dut.cfg_interrupt_msi_fail,
+            cfg_interrupt_msix_enable=dut.cfg_interrupt_msix_enable,
+            cfg_interrupt_msix_mask=dut.cfg_interrupt_msix_mask,
+            cfg_interrupt_msix_vf_enable=dut.cfg_interrupt_msix_vf_enable,
+            cfg_interrupt_msix_vf_mask=dut.cfg_interrupt_msix_vf_mask,
+            cfg_interrupt_msix_address=dut.cfg_interrupt_msix_address,
+            cfg_interrupt_msix_data=dut.cfg_interrupt_msix_data,
+            cfg_interrupt_msix_int=dut.cfg_interrupt_msix_int,
+            cfg_interrupt_msix_sent=dut.cfg_interrupt_msix_sent,
+            cfg_interrupt_msix_fail=dut.cfg_interrupt_msix_fail,
             cfg_interrupt_msi_attr=dut.cfg_interrupt_msi_attr,
             cfg_interrupt_msi_tph_present=dut.cfg_interrupt_msi_tph_present,
             cfg_interrupt_msi_tph_type=dut.cfg_interrupt_msi_tph_type,
@@ -224,6 +256,9 @@ class TB:
         dut.cfg_interrupt_msi_pending_status.setimmediatevalue(0)
         dut.cfg_interrupt_msi_pending_status_data_enable.setimmediatevalue(0)
         dut.cfg_interrupt_msi_pending_status_function_num.setimmediatevalue(0)
+        dut.cfg_interrupt_msix_address.setimmediatevalue(0)
+        dut.cfg_interrupt_msix_data.setimmediatevalue(0)
+        dut.cfg_interrupt_msix_int.setimmediatevalue(0)
         dut.cfg_interrupt_msi_attr.setimmediatevalue(0)
         dut.cfg_interrupt_msi_tph_present.setimmediatevalue(0)
         dut.cfg_interrupt_msi_tph_type.setimmediatevalue(0)
@@ -245,8 +280,10 @@ class TB:
         self.rc.make_port().connect(self.dev)
 
         # user logic
+        rc_segments = 2 if rc_straddle else 1
+
         self.rq_source = RqSource(AxiStreamBus.from_prefix(dut, "s_axis_rq"), dut.user_clk, dut.user_reset)
-        self.rc_sink = RcSink(AxiStreamBus.from_prefix(dut, "m_axis_rc"), dut.user_clk, dut.user_reset)
+        self.rc_sink = RcSink(AxiStreamBus.from_prefix(dut, "m_axis_rc"), dut.user_clk, dut.user_reset, segments=rc_segments)
         self.cq_sink = CqSink(AxiStreamBus.from_prefix(dut, "m_axis_cq"), dut.user_clk, dut.user_reset)
         self.cc_source = CcSource(AxiStreamBus.from_prefix(dut, "s_axis_cc"), dut.user_clk, dut.user_reset)
 
@@ -254,19 +291,27 @@ class TB:
         self.regions[0] = mmap.mmap(-1, 1024*1024)
         self.regions[1] = mmap.mmap(-1, 1024*1024)
         self.regions[3] = mmap.mmap(-1, 1024)
+        self.regions[4] = mmap.mmap(-1, 1024*64)
 
         self.current_tag = 0
-        self.tag_count = 32
+        self.tag_count = 64
         self.tag_active = [False]*256
         self.tag_release = Event()
 
-        self.dev.functions[0].msi_cap.msi_multiple_message_capable = 5
+        self.rq_tag = Queue()
+
+        self.rx_cpl_queues = [Queue() for k in range(256)]
+        self.rx_cpl_sync = [Event() for k in range(256)]
 
         self.dev.functions[0].configure_bar(0, len(self.regions[0]))
         self.dev.functions[0].configure_bar(1, len(self.regions[1]), True, True)
         self.dev.functions[0].configure_bar(3, len(self.regions[3]), False, False, True)
+        self.dev.functions[0].configure_bar(4, len(self.regions[4]))
 
-        cocotb.fork(self._run_cq())
+        if not self.client_tag:
+            cocotb.start_soon(self._run_rq_tags())
+        cocotb.start_soon(self._run_rc())
+        cocotb.start_soon(self._run_cq())
 
     def set_idle_generator(self, generator=None):
         if generator:
@@ -278,8 +323,26 @@ class TB:
             self.dev.rq_sink.set_pause_generator(generator())
             self.dev.cc_sink.set_pause_generator(generator())
 
+    async def recv_cpl(self, tag, timeout=0, timeout_unit='ns'):
+        queue = self.rx_cpl_queues[tag]
+        sync = self.rx_cpl_sync[tag]
+
+        if not queue.empty():
+            return queue.get_nowait()
+
+        sync.clear()
+        if timeout:
+            await First(sync.wait(), Timer(timeout, timeout_unit))
+        else:
+            await sync.wait()
+
+        if not queue.empty():
+            return queue.get_nowait()
+
+        return None
+
     async def alloc_tag(self):
-        tag_count = min(256, self.tag_count)
+        tag_count = min(256 if self.dev.functions[0].pcie_cap.extended_tag_field_enable else 32, self.tag_count)
 
         while True:
             tag = self.current_tag
@@ -298,89 +361,144 @@ class TB:
         self.tag_active[tag] = False
         self.tag_release.set()
 
+    async def perform_posted_operation(self, req):
+        await self.rq_source.send(req.pack_us_rq())
+
+    async def perform_nonposted_operation(self, req, timeout=0, timeout_unit='ns'):
+        completions = []
+
+        if self.client_tag:
+            req.tag = await self.alloc_tag()
+            await self.rq_source.send(req.pack_us_rq())
+        else:
+            await self.rq_source.send(req.pack_us_rq())
+            req.tag = await self.rq_tag.get()
+
+        while True:
+            cpl = await self.recv_cpl(req.tag, timeout, timeout_unit)
+
+            if not cpl:
+                break
+
+            completions.append(cpl)
+
+            if cpl.status != CplStatus.SC:
+                # bad status
+                break
+            elif req.fmt_type in {TlpType.MEM_READ, TlpType.MEM_READ_64}:
+                # completion for memory read request
+
+                # request completed
+                if cpl.byte_count <= cpl.length*4 - (cpl.lower_address & 0x3):
+                    break
+
+                # completion for read request has SC status but no data
+                if cpl.fmt_type in {TlpType.CPL, TlpType.CPL_LOCKED}:
+                    break
+
+            else:
+                # completion for other request
+                break
+
+        if self.client_tag:
+            self.release_tag(req.tag)
+
+        return completions
+
     async def dma_io_write(self, addr, data, timeout=0, timeout_unit='ns'):
         n = 0
 
-        while True:
-            tlp = Tlp_us()
-            tlp.fmt_type = TlpType.IO_WRITE
-            tlp.requester_id = PcieId(0, 0, 0)
+        zero_len = len(data) == 0
+        if zero_len:
+            data = b'\x00'
+
+        op_list = []
+
+        while n < len(data):
+            req = Tlp_us()
+            req.fmt_type = TlpType.IO_WRITE
+            req.requester_id = PcieId(0, 0, 0)
 
             first_pad = addr % 4
             byte_length = min(len(data)-n, 4-first_pad)
-            tlp.set_addr_be_data(addr, data[n:n+byte_length])
+            req.set_addr_be_data(addr, data[n:n+byte_length])
 
-            tlp.tag = await self.alloc_tag()
+            if zero_len:
+                req.first_be = 0
 
-            await self.rq_source.send(tlp.pack_us_rq())
-            pkt = await self.rc_sink.recv()
-
-            self.release_tag(tlp.tag)
-
-            if not pkt:
-                raise Exception("Timeout")
-
-            cpl = Tlp_us.unpack_us_rc(pkt)
-
-            if cpl.status != CplStatus.SC:
-                raise Exception("Unsuccessful completion")
+            op_list.append(cocotb.start_soon(self.perform_nonposted_operation(req, timeout, timeout_unit)))
 
             n += byte_length
             addr += byte_length
 
-            if n >= len(data):
-                break
+        for op in op_list:
+            cpl_list = await op.join()
+
+            if not cpl_list:
+                raise Exception("Timeout")
+            if cpl_list[0].status != CplStatus.SC:
+                raise Exception("Unsuccessful completion")
 
     async def dma_io_read(self, addr, length, timeout=0, timeout_unit='ns'):
-        data = b''
+        data = bytearray()
         n = 0
 
-        while True:
-            tlp = Tlp_us()
-            tlp.fmt_type = TlpType.IO_READ
-            tlp.requester_id = PcieId(0, 0, 0)
+        zero_len = length <= 0
+        if zero_len:
+            length = 1
+
+        op_list = []
+
+        while n < length:
+            req = Tlp_us()
+            req.fmt_type = TlpType.IO_READ
+            req.requester_id = PcieId(0, 0, 0)
 
             first_pad = addr % 4
             byte_length = min(length-n, 4-first_pad)
-            tlp.set_addr_be(addr, byte_length)
+            req.set_addr_be(addr, byte_length)
 
-            tlp.tag = await self.alloc_tag()
+            if zero_len:
+                req.first_be = 0
 
-            await self.rq_source.send(tlp.pack_us_rq())
-            pkt = await self.rc_sink.recv()
-
-            self.release_tag(tlp.tag)
-
-            if not pkt:
-                raise Exception("Timeout")
-
-            cpl = Tlp_us.unpack_us_rc(pkt)
-
-            if cpl.status != CplStatus.SC:
-                raise Exception("Unsuccessful completion")
-            else:
-                d = cpl.get_data()
-
-            data += d[first_pad:]
+            op_list.append((first_pad, cocotb.start_soon(self.perform_nonposted_operation(req, timeout, timeout_unit))))
 
             n += byte_length
             addr += byte_length
 
-            if n >= length:
-                break
+        for first_pad, op in op_list:
+            cpl_list = await op.join()
 
-        return data[:length]
+            if not cpl_list:
+                raise Exception("Timeout")
+            cpl = cpl_list[0]
+            if cpl.status != CplStatus.SC:
+                raise Exception("Unsuccessful completion")
+
+            assert cpl.length == 1
+            d = cpl.get_data()
+
+            data.extend(d[first_pad:])
+
+        if zero_len:
+            return b''
+
+        return bytes(data[:length])
 
     async def dma_mem_write(self, addr, data, timeout=0, timeout_unit='ns'):
         n = 0
 
-        while True:
-            tlp = Tlp_us()
+        zero_len = len(data) == 0
+        if zero_len:
+            data = b'\x00'
+
+        while n < len(data):
+            req = Tlp_us()
             if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_WRITE_64
+                req.fmt_type = TlpType.MEM_WRITE_64
             else:
-                tlp.fmt_type = TlpType.MEM_WRITE
-            tlp.requester_id = PcieId(0, 0, 0)
+                req.fmt_type = TlpType.MEM_WRITE
+            req.requester_id = PcieId(0, 0, 0)
 
             first_pad = addr % 4
             byte_length = len(data)-n
@@ -388,75 +506,101 @@ class TB:
             byte_length = min(byte_length, (128 << self.dut.cfg_max_payload.value.integer)-first_pad)
             # 4k address align
             byte_length = min(byte_length, 0x1000 - (addr & 0xfff))
-            tlp.set_addr_be_data(addr, data[n:n+byte_length])
+            req.set_addr_be_data(addr, data[n:n+byte_length])
 
-            await self.rq_source.send(tlp.pack_us_rq())
+            if zero_len:
+                req.first_be = 0
+
+            await self.perform_posted_operation(req)
 
             n += byte_length
             addr += byte_length
 
-            if n >= len(data):
-                break
-
     async def dma_mem_read(self, addr, length, timeout=0, timeout_unit='ns'):
-        data = b''
+        data = bytearray()
         n = 0
 
-        while True:
-            tlp = Tlp_us()
+        zero_len = length <= 0
+        if zero_len:
+            length = 1
+
+        op_list = []
+
+        while n < length:
+            req = Tlp_us()
             if addr > 0xffffffff:
-                tlp.fmt_type = TlpType.MEM_READ_64
+                req.fmt_type = TlpType.MEM_READ_64
             else:
-                tlp.fmt_type = TlpType.MEM_READ
-            tlp.requester_id = PcieId(0, 0, 0)
+                req.fmt_type = TlpType.MEM_READ
+            req.requester_id = PcieId(0, 0, 0)
 
             first_pad = addr % 4
+            # remaining length
             byte_length = length-n
-            # max read request size
-            byte_length = min(byte_length, (128 << self.dut.cfg_max_read_req.value.integer)-first_pad)
-            # 4k address align
+            # limit to max read request size
+            if byte_length > (128 << self.dut.cfg_max_read_req.value.integer) - first_pad:
+                # split on 128-byte read completion boundary
+                byte_length = min(byte_length, (128 << self.dut.cfg_max_read_req.value.integer) - (addr & 0x7f))
+            # 4k align
             byte_length = min(byte_length, 0x1000 - (addr & 0xfff))
-            tlp.set_addr_be(addr, byte_length)
+            req.set_addr_be(addr, byte_length)
 
-            tlp.tag = await self.alloc_tag()
+            if zero_len:
+                req.first_be = 0
 
-            await self.rq_source.send(tlp.pack_us_rq())
+            op_list.append((byte_length, cocotb.start_soon(self.perform_nonposted_operation(req, timeout, timeout_unit))))
+
+            n += byte_length
+            addr += byte_length
+
+        for byte_length, op in op_list:
+            cpl_list = await op.join()
 
             m = 0
 
-            while True:
-                pkt = await self.rc_sink.recv()
-
-                if not pkt:
+            while m < byte_length:
+                if not cpl_list:
                     raise Exception("Timeout")
 
-                cpl = Tlp_us.unpack_us_rc(pkt)
+                cpl = cpl_list.pop(0)
 
                 if cpl.status != CplStatus.SC:
                     raise Exception("Unsuccessful completion")
-                else:
-                    assert cpl.byte_count+3+(cpl.lower_address & 3) >= cpl.length*4
-                    assert cpl.byte_count == max(byte_length - m, 1)
 
-                    d = cpl.get_data()
+                assert cpl.byte_count+3+(cpl.lower_address & 3) >= cpl.length*4
+                assert cpl.byte_count == max(byte_length - m, 1)
 
-                    offset = cpl.lower_address & 3
-                    data += d[offset:offset+cpl.byte_count]
+                d = cpl.get_data()
+
+                offset = cpl.lower_address & 3
+                data.extend(d[offset:offset+cpl.byte_count])
 
                 m += len(d)-offset
 
-                if m >= byte_length:
-                    break
+        if zero_len:
+            return b''
 
-            self.release_tag(tlp.tag)
+        return bytes(data[:length])
 
-            n += byte_length
-            addr += byte_length
+    async def _run_rq_tags(self):
+        clock_edge_event = RisingEdge(self.dut.user_clk)
 
-            if n >= length:
-                break
+        while True:
+            await clock_edge_event
 
-        return data[:length]
+            if self.dut.pcie_rq_tag_vld.value:
+                self.rq_tag.put_nowait(self.dut.pcie_rq_tag.value.integer)
+
+    async def _run_rc(self):
+        while True:
+            pkt = await self.rc_sink.recv()
+
+            tlp = Tlp_us.unpack_us_rc(pkt)
+
+            self.log.debug("RC TLP: %s", repr(tlp))
+
+            self.rx_cpl_queues[tlp.tag].put_nowait(tlp)
+            self.rx_cpl_sync[tlp.tag].set()
 
     async def _run_cq(self):
         while True:
@@ -635,48 +779,48 @@ async def run_test_mem(dut, idle_inserter=None, backpressure_inserter=None):
     await FallingEdge(dut.user_reset)
     await Timer(100, 'ns')
 
-    await tb.rc.enumerate(enable_bus_mastering=True, configure_msi=True)
+    await tb.rc.enumerate()
 
-    dev_bar0 = tb.rc.tree[0][0].bar_addr[0]
-    dev_bar1 = tb.rc.tree[0][0].bar_addr[1]
-    dev_bar3 = tb.rc.tree[0][0].bar_addr[3]
+    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
+    await dev.enable_device()
+
+    dev_bar0 = dev.bar_window[0]
+    dev_bar1 = dev.bar_window[1]
+    dev_bar3 = dev.bar_window[3]
 
     for length in list(range(0, 8)):
         for offset in list(range(8)):
             tb.log.info("IO operation length: %d offset: %d", length, offset)
-            addr = dev_bar3+offset
             test_data = bytearray([x % 256 for x in range(length)])
 
-            await tb.rc.io_write(addr, test_data, 5000)
+            await dev_bar3.write(offset, test_data, timeout=5000)
             assert tb.regions[3][offset:offset+length] == test_data
 
-            assert await tb.rc.io_read(addr, length, 5000) == test_data
+            assert await dev_bar3.read(offset, length, timeout=5000) == test_data
 
     for length in list(range(0, 32))+[1024]:
         for offset in list(range(8))+list(range(4096-8, 4096)):
             tb.log.info("Memory operation (32-bit BAR) length: %d offset: %d", length, offset)
-            addr = dev_bar0+offset
             test_data = bytearray([x % 256 for x in range(length)])
 
-            await tb.rc.mem_write(addr, test_data, 100)
+            await dev_bar0.write(offset, test_data, timeout=100)
             # wait for write to complete
-            await tb.rc.mem_read(addr, 1, 5000)
+            await dev_bar0.read(offset, 0, timeout=5000)
             assert tb.regions[0][offset:offset+length] == test_data
 
-            assert await tb.rc.mem_read(addr, length, 5000) == test_data
+            assert await dev_bar0.read(offset, length, timeout=5000) == test_data
 
     for length in list(range(0, 32))+[1024]:
         for offset in list(range(8))+list(range(4096-8, 4096)):
             tb.log.info("Memory operation (64-bit BAR) length: %d offset: %d", length, offset)
-            addr = dev_bar1+offset
             test_data = bytearray([x % 256 for x in range(length)])
 
-            await tb.rc.mem_write(addr, test_data, 100)
+            await dev_bar1.write(offset, test_data, timeout=100)
             # wait for write to complete
-            await tb.rc.mem_read(addr, 1, 5000)
+            await dev_bar1.read(offset, 0, timeout=5000)
             assert tb.regions[1][offset:offset+length] == test_data
 
-            assert await tb.rc.mem_read(addr, length, 5000) == test_data
+            assert await dev_bar1.read(offset, length, timeout=5000) == test_data
 
     await RisingEdge(dut.user_clk)
     await RisingEdge(dut.user_clk)
@@ -686,8 +830,11 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
 
     tb = TB(dut)
 
-    mem_base, mem_data = tb.rc.alloc_region(1024*1024)
-    io_base, io_data = tb.rc.alloc_io_region(1024)
+    mem = tb.rc.mem_pool.alloc_region(16*1024*1024)
+    mem_base = mem.get_absolute_address(0)
+
+    io = tb.rc.io_pool.alloc_region(1024)
+    io_base = io.get_absolute_address(0)
 
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
@@ -695,7 +842,11 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
     await FallingEdge(dut.user_reset)
     await Timer(100, 'ns')
 
-    await tb.rc.enumerate(enable_bus_mastering=True, configure_msi=True)
+    await tb.rc.enumerate()
+
+    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
+    await dev.enable_device()
+    await dev.set_master()
 
     for length in list(range(0, 32))+[1024]:
         for offset in list(range(8))+list(range(4096-8, 4096)):
@@ -705,8 +856,8 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
 
             await tb.dma_mem_write(addr, test_data, 5000, 'ns')
             # wait for write to complete
-            await tb.dma_mem_read(addr, 1, 5000, 'ns')
-            assert mem_data[offset:offset+length] == test_data
+            await tb.dma_mem_read(addr, 0, 5000, 'ns')
+            assert mem[offset:offset+length] == test_data
 
             assert await tb.dma_mem_read(addr, length, 5000, 'ns') == test_data
 
@@ -717,7 +868,7 @@ async def run_test_dma(dut, idle_inserter=None, backpressure_inserter=None):
             test_data = bytearray([x % 256 for x in range(length)])
 
             await tb.dma_io_write(addr, test_data, 5000, 'ns')
-            assert io_data[offset:offset+length] == test_data
+            assert io[offset:offset+length] == test_data
 
             assert await tb.dma_io_read(addr, length, 5000, 'ns') == test_data
 
@@ -735,19 +886,110 @@ async def run_test_msi(dut, idle_inserter=None, backpressure_inserter=None):
     await FallingEdge(dut.user_reset)
     await Timer(100, 'ns')
 
-    await tb.rc.enumerate(enable_bus_mastering=True, configure_msi=True)
+    await tb.rc.enumerate()
+
+    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
+    await dev.enable_device()
+    await dev.set_master()
+    await dev.alloc_irq_vectors(32, 32)
+
+    assert dut.cfg_interrupt_msi_enable.value.integer & 1
 
     for k in range(32):
         tb.log.info("Send MSI %d", k)
 
         await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msi_int <= 1 << k
+        tb.dut.cfg_interrupt_msi_int.value = 1 << k
         await RisingEdge(dut.user_clk)
-        tb.dut.cfg_interrupt_msi_int <= 0
+        tb.dut.cfg_interrupt_msi_int.value = 0
 
-        event = tb.rc.msi_get_event(tb.dev.functions[0].pcie_id, k)
+        while not tb.dut.cfg_interrupt_msi_sent.value.integer and not tb.dut.cfg_interrupt_msi_fail.value.integer:
+            await RisingEdge(dut.user_clk)
+
+        event = dev.msi_vectors[k].event
         event.clear()
         await event.wait()
+
+    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.user_clk)
+
+
+async def run_test_msix(dut, idle_inserter=None, backpressure_inserter=None):
+
+    tb = TB(dut, msix=True)
+
+    tb.set_idle_generator(idle_inserter)
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    await FallingEdge(dut.user_reset)
+    await Timer(100, 'ns')
+
+    await tb.rc.enumerate()
+
+    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
+    await dev.enable_device()
+    await dev.set_master()
+    await dev.alloc_irq_vectors(64, 64)
+
+    for k in range(64):
+        tb.log.info("Send MSI %d", k)
+
+        addr = int.from_bytes(tb.regions[4][16*k+0:16*k+8], 'little')
+        data = int.from_bytes(tb.regions[4][16*k+8:16*k+12], 'little')
+
+        await RisingEdge(dut.user_clk)
+        tb.dut.cfg_interrupt_msix_address.value = addr
+        tb.dut.cfg_interrupt_msix_data.value = data
+        tb.dut.cfg_interrupt_msix_int.value = 1
+        await RisingEdge(dut.user_clk)
+        tb.dut.cfg_interrupt_msix_int.value = 0
+
+        while not tb.dut.cfg_interrupt_msix_sent.value.integer and not tb.dut.cfg_interrupt_msix_fail.value.integer:
+            await RisingEdge(dut.user_clk)
+
+        event = dev.msi_vectors[k].event
+        event.clear()
+        await event.wait()
+
+    await RisingEdge(dut.user_clk)
+    await RisingEdge(dut.user_clk)
+
+
+async def run_test_crs(dut, idle_inserter=None, backpressure_inserter=None):
+
+    tb = TB(dut)
+
+    tb.set_idle_generator(idle_inserter)
+    tb.set_backpressure_generator(backpressure_inserter)
+
+    await FallingEdge(dut.user_reset)
+    await Timer(100, 'ns')
+
+    async def toggle_config_space_enable(dut):
+        dut.cfg_config_space_enable.setimmediatevalue(0)
+        await Timer(100, 'us')
+        dut.cfg_config_space_enable.setimmediatevalue(1)
+
+    cocotb.start_soon(toggle_config_space_enable(dut))
+
+    await tb.rc.enumerate()
+
+    dev = tb.rc.find_device(tb.dev.functions[0].pcie_id)
+    await dev.enable_device()
+
+    dut.cfg_config_space_enable.setimmediatevalue(0)
+
+    val = await dev.config_read_dword(0x00)
+    tb.log.info("ID register values: 0x%08x", val)
+
+    assert val == 0xffff0001
+
+    dut.cfg_config_space_enable.setimmediatevalue(1)
+
+    val = await dev.config_read_dword(0x00)
+    tb.log.info("ID register values: 0x%08x", val)
+
+    assert val != 0xffff0001 and val != 0xffffffff
 
     await RisingEdge(dut.user_clk)
     await RisingEdge(dut.user_clk)
@@ -763,6 +1005,8 @@ if cocotb.SIM_NAME:
                 run_test_mem,
                 run_test_dma,
                 run_test_msi,
+                run_test_msix,
+                run_test_crs,
             ]:
 
         factory = TestFactory(test)
@@ -775,8 +1019,10 @@ if cocotb.SIM_NAME:
 tests_dir = os.path.dirname(__file__)
 
 
-@pytest.mark.parametrize("data_width", [64, 128, 256])
-def test_pcie_us(request, data_width):
+@pytest.mark.parametrize("client_tag", [True, False])
+@pytest.mark.parametrize(("data_width", "straddle"),
+    [(64, False), (128, False), (256, False), (256, True)])
+def test_pcie_us(request, data_width, straddle, client_tag):
     dut = "test_pcie_us"
     module = os.path.splitext(os.path.basename(__file__))[0]
     toplevel = dut
@@ -795,6 +1041,9 @@ def test_pcie_us(request, data_width):
     parameters['CC_USER_WIDTH'] = 33
 
     extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
+
+    extra_env['STRADDLE'] = str(int(straddle))
+    extra_env['CLIENT_TAG'] = str(int(client_tag))
 
     sim_build = os.path.join(tests_dir, "sim_build",
         request.node.name.replace('[', '-').replace(']', ''))
